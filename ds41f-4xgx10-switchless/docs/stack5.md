@@ -188,7 +188,26 @@ step; the lost drafts cost the lead change times the accepted drafts' share of a
 3.9 on code). All dense: chat +1.2 % - 1.05 % = +0.15 %, code about 0. With the better scale: chat +0.2 %, code +0.2 %.
 Shared experts and main_proj alone: +0.1 %. So post-hoc 4-bit is a wash and it was not built. A quantisation-aware fine-tune
 that restored the accuracy fully would be worth at most +1.2 % on chat and +1.0 % on code (simulated), and the engine would
-need MXFP4 forms of the drafter's attention GEMVs; neither was done.
+need MXFP4 forms of the drafter's attention GEMVs.
+
+A small quantisation-aware pilot was run (not a full fine-tune): MXFP4 rounding with a straight-through gradient on all dense
+latents, 22 minutes per regime on one box each, trained on the 166 held-out sequences the evaluation does not use (about
+196K anchors, four passes), scored on the same 100 / 30 / 20 sequences. Nothing was exported.
+
+| regime | chat lead | code lead | math lead |
+|---|---|---|---|
+| FP8 (shipped) | 1.4931 | 3.3656 | 3.5033 |
+| MXFP4 post hoc | 1.4634 | 3.3174 | 3.4665 |
+| AdamW 2e-5 | 1.4640 | 3.3285 | 3.4769 |
+| AdamW 1e-4 | 1.4342 | 3.3046 | 3.4863 |
+| SGD with momentum, 0.03 | 1.4645 | 3.3270 | 3.4773 |
+
+It does not close the gap: flat at the small rates, worse on chat at the larger one, which overfits the small training set.
+One thing worth knowing if you try this: FP8 latents are binary fractions, so about a quarter of them sit exactly on an MXFP4
+rounding tie. The first optimizer step, however small, then flips all of those at once in the gradient's direction and wrecks
+the model (training accuracy at depth 1 fell from .83 to .09 within ten steps at every rate we tried, AdamW or SGD). Starting
+each latent halfway between its FP8 value and its MXFP4 value removes that. A full fine-tune on millions of tokens was not
+run.
 
 ## Reproduce
 - Ring: `engine/comm/run4.sh <ring_test> latency graph --trace 4000 --direct 0|1|2`, then

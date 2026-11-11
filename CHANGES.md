@@ -115,6 +115,7 @@ Measured and not built:
   kernels by site and row count, about par on average; it reads its stored bytes at 216-237 GB/s against 248-258 GB/s raw.
   The bar was 3 % of the dense time.
 - The drafter's FP8 body as MXFP4, post hoc, in the torch mirror: accepted length -1.9 % chat, -1.3 % code, -1.4 % math for a
-  pass that would be 0.30 ms shorter; first-order simulated gain 0 to +0.2 %. A quantisation-aware fine-tune was not run.
+  pass that would be 0.30 ms shorter; first-order simulated gain 0 to +0.2 %. A 22-minute quantisation-aware pilot on
+  166 held-out sequences did not close the gap (chat accepted length 1.463 -> 1.464, FP8 1.493); a full fine-tune was not run.
 
 The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
