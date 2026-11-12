@@ -52,7 +52,13 @@ fn write_checkpoint(dir: &Path) {
             ("layers.0.attn.wo_b.weight", "F8_E4M3", &[64, 256], &pattern(16384, 4)),
             ("layers.0.attn.wo_b.scale", "F8_E8M0", &[2, 8], &pattern(16, 5)),
             ("layers.0.ffn.experts.0.w1.weight", "I8", &[64, 64], &pattern(4096, 6)),
+            ("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[64, 4], &pattern(256, 14)),
+            ("layers.0.ffn.experts.0.w2.weight", "I8", &[64, 128], &pattern(8192, 16)),
+            ("layers.0.ffn.experts.0.w2.scale", "F8_E8M0", &[64, 8], &pattern(512, 17)),
             ("layers.0.ffn.experts.1.w1.weight", "I8", &[64, 64], &pattern(4096, 7)),
+            ("layers.0.ffn.experts.1.w1.scale", "F8_E8M0", &[64, 4], &pattern(256, 15)),
+            ("layers.0.ffn.experts.1.w2.weight", "I8", &[64, 128], &pattern(8192, 18)),
+            ("layers.0.ffn.experts.1.w2.scale", "F8_E8M0", &[64, 8], &pattern(512, 19)),
             ("layers.0.engram.wkv.weight", "F8_E4M3", &[640, 128], &pattern(81920, 8)),
             ("layers.0.engram.wkv.scale", "F8_E8M0", &[20, 4], &pattern(80, 9)),
         ],
@@ -73,7 +79,13 @@ fn write_checkpoint(dir: &Path) {
         "layers.0.attn.wo_b.weight": "model-00001-of-00002.safetensors",
         "layers.0.attn.wo_b.scale": "model-00001-of-00002.safetensors",
         "layers.0.ffn.experts.0.w1.weight": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.experts.0.w1.scale": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.experts.0.w2.weight": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.experts.0.w2.scale": "model-00001-of-00002.safetensors",
         "layers.0.ffn.experts.1.w1.weight": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.experts.1.w1.scale": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.experts.1.w2.weight": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.experts.1.w2.scale": "model-00001-of-00002.safetensors",
         "layers.0.engram.wkv.weight": "model-00001-of-00002.safetensors",
         "layers.0.engram.wkv.scale": "model-00001-of-00002.safetensors",
         "layers.1.engram.embed.weight": "model-00002-of-00002.safetensors",
@@ -140,8 +152,9 @@ fn converts_all_ranks_and_every_output_verifies() {
         assert_eq!(hb.rank, r);
         assert_eq!(hb.world, 4);
         assert_eq!(&hb.magic, b"DSGB10W1");
-        // embed, attn_norm, wq_b, wo_b (+scale), the stacked experts, engram.wkv (+scale)
-        assert_eq!(hb.n_tensors, 8);
+        // embed, attn_norm, wq_b, wo_b (+scale), the stacked experts w1/w2 (+their
+        // scales), engram.wkv (+scale)
+        assert_eq!(hb.n_tensors, 11);
         assert_eq!(hb.file_bytes, f.metadata().unwrap().len());
         convert::verify_file(&ck, &f).unwrap_or_else(|e| panic!("rank {r}: {e}"));
 

@@ -368,17 +368,37 @@ fn cut(t: &SrcTensor, src_idx: usize, rule: Rule, r: u32, w: u32, base: u64) -> 
     Ok(c)
 }
 
-fn check_scale_pair(w: &OutTensor, s: &OutTensor) -> Result<(), String> {
+/// Block geometry of a quantised weight, in *logical* elements: FP8 weights carry
+/// one ue8m0 per 32x32 block, MXFP4 experts one per row and 32 elements along K.
+/// A packed expert stores two values a byte, so its columns — which the table and
+/// the pieces count in bytes — are doubled before the block arithmetic.
+fn block_of(t: &SrcTensor) -> Result<(u64, u64, u64), String> {
+    match t.dtype {
+        DType::F8E4M3 => Ok((32, 32, 1)),
+        DType::E2M1X2 => Ok((1, 32, 2)),
+        _ => Err(format!("{} has a scale but dtype {}", t.name, t.dtype)),
+    }
+}
+
+/// A scale must be cut exactly along the weight's blocks: same pieces, divided by
+/// the block size, and its own shape must be the weight's in blocks.
+fn check_scale_pair(ck: &Checkpoint, w: &OutTensor, s: &OutTensor) -> Result<(), String> {
     if w.pieces.len() != s.pieces.len() {
         return Err(format!("{} and its scale have different piece counts", w.name));
     }
-    let (br, bc) = match w.dtype {
-        DType::F8E4M3 => (32, 32),
-        DType::E2M1X2 => (1, 32),
-        _ => return Err(format!("{} has a scale but dtype {}", w.name, w.dtype)),
-    };
     for (pw, ps) in w.pieces.iter().zip(&s.pieces) {
-        let (c0, nc) = (pw.col0, pw.ncols);
+        let wt = &ck.tensors[pw.src];
+        let st = &ck.tensors[ps.src];
+        if st.dtype != DType::F8E8M0 {
+            return Err(format!("{}: scale dtype {}", st.name, st.dtype));
+        }
+        let (br, bc, epb) = block_of(wt)?;
+        let rows = wt.shape.first().copied().unwrap_or(1);
+        let cols = wt.shape.get(1).copied().unwrap_or(1) * epb;
+        if st.shape.len() != 2 || st.shape[0] != rows.div_ceil(br) || st.shape[1] != cols.div_ceil(bc) {
+            return Err(format!("{}: scale shape {:?} does not match weight {:?}", st.name, st.shape, wt.shape));
+        }
+        let (c0, nc) = (pw.col0 * epb, pw.ncols * epb);
         let ok = pw.row0 % br == 0
             && pw.nrows % br == 0
             && c0 % bc == 0
@@ -538,8 +558,9 @@ pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String>
         let wname = format!("{}.weight", &plan.tensors[i].name[..plan.tensors[i].name.len() - 6]);
         let wi = *by_name.get(wname.as_str()).ok_or_else(|| format!("{} has no weight", plan.tensors[i].name))?;
         let (w, s) = (&plan.tensors[wi], &plan.tensors[i]);
-        // The scale's own source tensor decides its block size; the weight's does.
-        check_scale_pair(w, s)?;
+        // The weight's source tensor decides the block size and the scale's must
+        // be that shape in blocks; both are the checkpoint's, not the slice's.
+        check_scale_pair(ck, w, s)?;
     }
 
     plan.tensors.sort_by(|a, b| {
@@ -775,6 +796,52 @@ mod tests {
         let p = make_plan(&ck, 0, 4).unwrap();
         assert_eq!(p.skipped.len(), 2);
         assert_eq!(p.tensors.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mxfp4_experts_cut_along_their_scale_blocks() {
+        // 32 values a scale, two values a byte: a 128-byte row is 256 values, 8
+        // scales. The columns are counted in bytes everywhere else, so the check
+        // is the one place the factor of two must appear.
+        let experts = |e: u32| {
+            vec![
+                (format!("layers.0.ffn.experts.{e}.w1.weight"), "I8".to_string(), vec![64u64, 128]),
+                (format!("layers.0.ffn.experts.{e}.w1.scale"), "F8_E8M0".to_string(), vec![64, 8]),
+                (format!("layers.0.ffn.experts.{e}.w2.weight"), "I8".to_string(), vec![64, 128]),
+                (format!("layers.0.ffn.experts.{e}.w2.scale"), "F8_E8M0".to_string(), vec![64, 8]),
+            ]
+        };
+        let owned: Vec<(String, String, Vec<u64>)> = experts(0).into_iter().chain(experts(1)).collect();
+        let refs: Vec<(&str, &str, &[u64])> =
+            owned.iter().map(|(n, d, s)| (n.as_str(), d.as_str(), s.as_slice())).collect();
+        let (dir, ck) = ck(&refs);
+        for world in [4u32, 2] {
+            for r in 0..world {
+                let p = make_plan(&ck, r, world).unwrap_or_else(|e| panic!("world {world} rank {r}: {e}"));
+                let get = |n: &str| p.tensors.iter().find(|t| t.name == n).unwrap();
+                let (w1, s1) = (get("layers.0.ffn.experts.w1.weight"), get("layers.0.ffn.experts.w1.scale"));
+                // Rows: the rows split, the columns (and so the scales) stay whole.
+                assert_eq!(w1.pieces[0].nrows, 64 / world as u64);
+                assert_eq!(w1.pieces[0].ncols, 128);
+                assert_eq!(s1.pieces[0].ncols, 8);
+                // Cols: the scale follows the weight's bytes, two values per byte.
+                let (w2, s2) = (get("layers.0.ffn.experts.w2.weight"), get("layers.0.ffn.experts.w2.scale"));
+                assert_eq!(w2.pieces[0].ncols, 128 / world as u64);
+                assert_eq!(s2.pieces[0].ncols, 8 / world as u64);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_scale_of_the_wrong_shape_is_refused() {
+        let (dir, ck) = ck(&[
+            ("layers.0.ffn.experts.0.w1.weight", "I8", &[64, 128]),
+            ("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[64, 4]),
+        ]);
+        let err = make_plan(&ck, 0, 4).unwrap_err();
+        assert!(err.contains("does not match weight"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
