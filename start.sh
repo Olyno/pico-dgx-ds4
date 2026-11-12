@@ -110,6 +110,22 @@ prepare() {
       die "prepare: '$1' failed"
   }
 
+  # Space, before anything long: the checkpoint (~510 GB, once) plus each rank's
+  # file and Engram shards (~130 GB a rank: 78 + 51) under PREPARE_OUT.
+  space_ok() {  # path need_gb what
+    local d=$1 free
+    while [ ! -d "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done
+    free=$(df -Pk "$d" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
+    [ "${free:-0}" -ge "$2" ] && return 0
+    local msg="only ${free:-?} GiB free on $d; $3 needs ~$2 GiB"
+    [ "$DRY" = "1" ] && { warn "DRY_RUN: $msg"; return 0; }
+    die "$msg (NEED_GB / OUT_GB override; /data is the other mount the container sees)"
+  }
+  local need_ckpt=0
+  [ -f "$ckpt/config.json" ] || need_ckpt=${NEED_GB:-520}
+  space_ok "$ckpt" "$need_ckpt" "the checkpoint"
+  space_ok "$out" $((TP * ${OUT_GB:-130})) "the rank files and Engram shards (TP=$TP)"
+
   if [ "$nodl" = 1 ]; then
     log "prepare: --no-download, using $ckpt"
   else
@@ -117,16 +133,6 @@ prepare() {
       # A download that ran out of space leaves config.json behind and shards short: the
       # converter then fails on a tensor count. hf download is idempotent and resumes.
       log "prepare: checkpoint present at $ckpt: re-checking it (hf download repairs a partial one)"
-    else
-      # The checkpoint is ~510 GB: fail before a long download that cannot finish.
-      local dir free_gb
-      dir=$(dirname "$ckpt")
-      while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir=$(dirname "$dir"); done
-      free_gb=$(df -Pk "$dir" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
-      if [ "${free_gb:-0}" -lt "${NEED_GB:-520}" ]; then
-        [ "$DRY" = "1" ] && warn "DRY_RUN: only ${free_gb:-?} GiB free on $dir (the checkpoint needs ~510)" ||
-          die "only ${free_gb:-?} GiB free on $dir; the checkpoint needs ~510 GiB (NEED_GB=N to override)"
-      fi
     fi
     # hf (huggingface_hub >= 0.27) or the older CLI, chosen once: a `||` chain
     # would mask a failed download as "command not found".
