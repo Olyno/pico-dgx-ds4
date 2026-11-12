@@ -25,8 +25,9 @@
 #   ./start.sh --help
 #   DRY_RUN=1 ./start.sh       print every command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
-#   KEEP_CHECKPOINT=1 ./start.sh  never release the checkpoint's blocks while
-#                              converting (the default streams it: --consume)
+# The default run streams the checkpoint as it converts (--consume): 507 GB of
+# model and 508 GB of rank files do not fit one disk. To keep the checkpoint,
+# run ./start.sh prepare without --consume first; it then refuses if it cannot.
 #
 # The artifacts live where the fleet puts rank 0's weight file (RANK0_WEIGHTS):
 # rank 0 reads them there, so nothing is copied on the head; its Engram shards and
@@ -166,22 +167,19 @@ prepare() {
   done
   if [ "$auto" = "auto" ]; then
     [ "$VISION" = "1" ] && args+=(--vision)
-    args+=(--replace)
-    [ "${KEEP_CHECKPOINT:-0}" = "1" ] || args+=(--consume)
+    args+=(--replace --consume)
   fi
   log "prepare: $TP rank file(s), Engram shards and the hash map into $OUT"
-  # --cpu-shares, not --cpus: the conversion keeps every core when the box is
-  # idle and steps aside when it is not. PREPARE_CPU_SHARES / PREPARE_NICE tune it.
-  local cmd=(docker run --rm "${ttyarg[@]}" --ipc=host --network host
-    --cpu-shares "${PREPARE_CPU_SHARES:-512}"
+  # --cpu-shares, not --cpus: the conversion takes every core while the box is
+  # idle and steps aside when something else wants them (a third of the CPU).
+  local cmd=(docker run --rm "${ttyarg[@]}" --ipc=host --network host --cpu-shares 512
     -v "$HOME:/root" -v /data:/data -w /work/ds41f-4xgx10-switchless "${envarg[@]}")
   if [ "$DRY" = "1" ]; then
-    echo "    ${cmd[*]} $IMAGE nice -n ${PREPARE_NICE:-10} prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${outarg[*]} ${args[*]}"
+    echo "    ${cmd[*]} $IMAGE prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${outarg[*]} ${args[*]}"
     return 0
   fi
   mkdir -p "$OUT"
-  "${cmd[@]}" "$IMAGE" nice -n "${PREPARE_NICE:-10}" \
-    prepare/target/release/dsw-prepare prepare "${worldarg[@]}" "${outarg[@]}" "${args[@]}" ||
+  "${cmd[@]}" "$IMAGE" prepare/target/release/dsw-prepare prepare "${worldarg[@]}" "${outarg[@]}" "${args[@]}" ||
     die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
 }
 
