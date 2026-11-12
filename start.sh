@@ -148,6 +148,9 @@ prepare() {
     prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable)" \
       "if command -v hf >/dev/null 2>&1; then hf download $repo --revision $rev --local-dir $ckpt_in; else huggingface-cli download $repo --revision $rev --local-dir $ckpt_in; fi"
   fi
+  # dsw_convert statvfs()es the output's directory before writing, and engram_pack
+  # writes into $out/engram: both must exist (the container sees the same paths).
+  [ "$DRY" = "1" ] || mkdir -p "$out/engram" || die "cannot create $out"
   for ((r = 0; r < TP; r++)); do
     prep_exec "cut rank $r of $TP" \
       "engine/build/weights/dsw_convert --ckpt $ckpt_in --rank $r --world $TP --out $out_in/rank$r.dsw"
