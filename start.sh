@@ -103,12 +103,21 @@ usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' 
 # — and a fleet file names exactly the same ranks. With neither, the engine's own
 # world, 4, is the only split that runs today.
 read -r -a _WORKERS <<< "${WORKERS:-${WORKER:-}}"
+fleet_ranks=0
+if [ -f "$FLEET" ]; then
+  last=$(grep -oE '^RANK[0-9]+_SSH=' "$FLEET" | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+  [ -n "${last:-}" ] && fleet_ranks=$((last + 1))
+fi
 derived_tp=0
 if [ "${#_WORKERS[@]}" -gt 0 ]; then
   derived_tp=$((${#_WORKERS[@]} + 1))
-elif [ -f "$FLEET" ]; then
-  last=$(grep -oE '^RANK[0-9]+_SSH=' "$FLEET" | grep -oE '[0-9]+' | sort -n | tail -1 || true)
-  [ -n "${last:-}" ] && derived_tp=$((last + 1))
+  # A WORKERS copied from another setup overrides the fleet without a word, which
+  # is how a four-box fleet ends up cut for two. Say it.
+  if [ "$fleet_ranks" -gt 0 ] && [ "$fleet_ranks" != "$derived_tp" ]; then
+    warn "WORKERS names $derived_tp rank(s), $FLEET names $fleet_ranks: WORKERS wins and ranks $derived_tp..$((fleet_ranks - 1)) are ignored (unset WORKERS to use the fleet's $fleet_ranks)"
+  fi
+elif [ "$fleet_ranks" -gt 0 ]; then
+  derived_tp=$fleet_ranks
 fi
 [ "$derived_tp" -gt 0 ] || derived_tp=4
 # A TP left in an old .env is a second source of truth, so it is checked, not obeyed.
