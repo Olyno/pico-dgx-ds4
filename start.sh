@@ -120,10 +120,18 @@ elif [ "$fleet_ranks" -gt 0 ]; then
   derived_tp=$fleet_ranks
 fi
 [ "$derived_tp" -gt 0 ] || derived_tp=4
-# A TP left in an old .env is a second source of truth, so it is checked, not obeyed.
+# TP=... (or DSGB10_TP) still wins when you set it: that is the knob, and the
+# cutter takes every world the model's shapes allow (1, 2, 4; not 3 — 5120 and
+# the 64 heads do not divide by it). What you cannot do yet is *serve* a world
+# other than 4: the kernels, the ring and the Engram store are built for it
+# (engine/common/tp.h), and the run says so before starting instead of after.
 explicit_tp="${TP:-${DSGB10_TP:-}}"
-[ -z "$explicit_tp" ] || [ "$explicit_tp" = "$derived_tp" ] ||
-  die "TP=$explicit_tp, but $derived_tp ranks are configured (${#_WORKERS[@]} worker(s) plus the head): TP follows WORKERS/the fleet now — remove TP from .env"
+if [ -n "$explicit_tp" ]; then
+  if [ "$explicit_tp" != "$derived_tp" ]; then
+    warn "TP=$explicit_tp overrides the $derived_tp rank(s) WORKERS/the fleet name: ranks $explicit_tp..$((derived_tp - 1)) are ignored"
+  fi
+  derived_tp=$explicit_tp
+fi
 export TP="$derived_tp" DSGB10_TP="$derived_tp"
 
 # A host path under $HOME is the same file at /root in the container.
