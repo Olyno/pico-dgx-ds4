@@ -87,6 +87,8 @@ state() {  # state words...: run/state is "<state> <epoch> <what>"; starting|wai
 settings() {
   ADDR=${DSGB10_ADDR:-127.0.0.1} PORT=${DSGB10_PORT:-18893}
   KEY=${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}
+  NOAUTH=${DSGB10_NO_AUTH:-0}  # 1: no bearer key (dsfront's --api-key-file omitted)
+  GATE=${DSGB10_CF_MLP:-} GATE=${GATE/#\~/$HOME}  # stack4 confidence gate: copied to every worker
   EARGS=${DSGB10_ENGINE_ARGS:---max-ctx 262144} FARGS=${DSGB10_FRONT_ARGS:-} NOTE=${DSGB10_NOTE:-}
   [ "$MOCK" = 1 ] && EARGS=${DSGB10_ENGINE_ARGS:---delay-ms 5}  # the mock engine's arguments
   BIN=${DSGB10_BIN:-$SRC/engine/build/server/$NAME} FBIN=${DSGB10_FRONT_BIN:-$SRC/frontend/target/release/dsfront}
@@ -119,8 +121,15 @@ check() {
   [ "$(addrs | sort | uniq -d)" = "" ] || die "DSGB10_ADDR names an address twice"
   [[ $PORT =~ ^[0-9]+$ ]] || die "DSGB10_PORT '$PORT' is not a port"
   [ "$PORT" != 8888 ] || [ "${DSGB10_PROD:-}" = 1 ] || die "port 8888 is the production endpoint: DSGB10_PROD=1"
-  [ -r "$KEY" ] || die "no API key file $KEY"
-  [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
+  if [ "$NOAUTH" = 1 ]; then
+    for a in $(addrs); do
+      [ "$a" = 127.0.0.1 ] || log "warning: DSGB10_NO_AUTH=1: requests on $a are not authenticated"
+    done
+  else
+    [ -r "$KEY" ] || die "no API key file $KEY (DSGB10_NO_AUTH=1 serves without one)"
+    [ $((8#$(stat -c %a "$KEY") & 8#077)) = 0 ] || die "$KEY can be read by others: chmod 600 it"
+  fi
+  [ -z "$GATE" ] || [ -r "$GATE" ] || die "DSGB10_CF_MLP=$GATE is not readable (the engine exits at start without it)"
   [[ $YIELD_IDLE_S =~ ^[0-9]+$ && $HOLD_S =~ ^[0-9]+$ ]] || die "DSGB10_YIELD_IDLE_S and DSGB10_HOLD_S are seconds"
   [[ $KEEP_GIB =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "DSGB10_KEEP_GIB '$KEEP_GIB' is not GiB"
   if [ "$MOCK" = 1 ]; then  # a test instance must share nothing with the service
@@ -189,6 +198,14 @@ freeze_boxes() {  # the frozen engine and fleet file on every worker, once, befo
       log "copying the binary to $w failed"
       return 1
     }
+    # stack4's confidence gate: every rank binds it from the same path (5.5 KB), so it travels with
+    # the binary instead of being copied to each box by hand (TP-1 workers, not always four).
+    if [ -n "$GATE" ]; then
+      scp -q -o BatchMode=yes -o ConnectTimeout=10 "$GATE" "$w:$(fleet_rel "$GATE")" || {
+        log "copying the confidence gate $GATE to $w failed"
+        return 1
+      }
+    fi
   done
   BOXES=1
 }
@@ -268,8 +285,10 @@ stop_engine() {  # rank 0 first: on SIGTERM a server ends the request in flight,
 }
 
 start_front() {
+  local -a keyarg=()
+  [ "$NOAUTH" = 1 ] || keyarg=(--api-key-file "$KEY")
   rotate "$LOGS/front.log"
-  "$H/bin/dsfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" --api-key-file "$KEY" \
+  "$H/bin/dsfront" serve $(addrs | sed "s|.*|--listen &:$PORT|") --engine-socket "$SOCK" "${keyarg[@]}" \
     --admin-socket "$ADMIN" --hold-s "$HOLD_S" --table-file "$RUN/front.table" $FARGS >> "$LOGS/front.log" 2>&1 < /dev/null 6>&- 8>&- 9>&- &
   FE=$! FE_T=$(date +%s)
   echo "$FE" > "$RUN/front.pid"
