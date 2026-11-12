@@ -61,6 +61,23 @@ impl Checkpoint {
         self.tensors.iter().map(|t| t.bytes).sum()
     }
 
+    /// The shards that are not fully allocated on disk: `--consume` punches holes
+    /// in a checkpoint as it converts it, so those tensors read as zeros and
+    /// converting from them again would write zeros into the rank files. One
+    /// `stat` per shard, and a good deal cheaper than finding out afterwards.
+    pub fn released(&self) -> Vec<usize> {
+        use std::os::unix::fs::MetadataExt;
+        self.shards
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| match &s.path {
+                Some(p) => std::fs::metadata(p).map(|m| m.blocks() * 512 < m.len()).unwrap_or(false),
+                None => false,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Opens every `*.safetensors` in `dir` and cross-checks the index, when one
     /// is present, against the tensors actually found: the index must name exactly
     /// those tensors and put each in the shard that holds it.

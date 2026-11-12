@@ -308,17 +308,43 @@ fn a_tampered_output_fails_verification() {
 }
 
 #[test]
-fn a_second_run_refuses_to_overwrite_a_finished_file() {
+fn a_second_run_keeps_the_finished_ranks() {
     let ckdir = out_dir("ck-twice");
     write_checkpoint(&ckdir);
     let out = out_dir("out-twice");
     let ck = Checkpoint::open(&ckdir).unwrap();
     let o = options(&out, false);
     convert::run(&ck, &reader(&ck), &o, "test").unwrap();
-    let err = convert::run(&ck, &reader(&ck), &o, "test").unwrap_err();
-    assert!(err.contains("already complete"), "{err}");
+    let before: Vec<Vec<u8>> = o.ranks.iter().map(|&r| std::fs::read(convert::dsw_path(&o, r)).unwrap()).collect();
+    // The whole point of running it again: nothing happens, and no prompt.
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
+    for (&r, bytes) in o.ranks.iter().zip(&before) {
+        assert_eq!(&std::fs::read(convert::dsw_path(&o, r)).unwrap(), bytes, "rank {r} was rewritten");
+    }
     let _ = std::fs::remove_dir_all(&ckdir);
     let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn a_released_checkpoint_is_recognised() {
+    let ckdir = out_dir("ck-holes");
+    write_checkpoint(&ckdir);
+    let ck = Checkpoint::open(&ckdir).unwrap();
+    assert!(ck.released().is_empty(), "a fresh checkpoint has no holes");
+    // The same punch an earlier --consume leaves behind, past the header so the
+    // shard still opens.
+    let shard = ck.shards[0].path.clone().unwrap();
+    let ok = std::process::Command::new("fallocate")
+        .args(["--punch-hole", "--offset", "4096", "--length", "4096"])
+        .arg(&shard)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if ok {
+        let ck = Checkpoint::open(&ckdir).unwrap();
+        assert_eq!(ck.released(), vec![0], "a punched shard must be reported");
+    }
+    let _ = std::fs::remove_dir_all(&ckdir);
 }
 
 #[test]

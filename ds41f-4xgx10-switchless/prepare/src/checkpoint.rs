@@ -6,9 +6,40 @@
 //! and then the same validation runs again. The download itself is a closure, so
 //! this module can be tested without a network.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::safetensors::Checkpoint;
+
+/// The checkpoint this machine already has, if any: the two directory names the
+/// README uses under `$HOME`, the `/data/models` layout the fleet points at, and
+/// the Hub cache `hf download` fills without `--local-dir`. First hit wins, and a
+/// directory counts only when a safetensors shard sits in it.
+///
+/// `--ckpt DIR` still overrides; this is what keeps `prepare` from downloading
+/// 507 GB that is already on the disk under another name.
+pub fn discover(home: &Path) -> Option<PathBuf> {
+    let mut candidates = vec![
+        home.join("DeepSeek-V4.1-Flash-1017"),
+        home.join("DeepSeek-V4.1-Flash"),
+        PathBuf::from("/data/models/DeepSeek-V4.1-Flash-1017"),
+        PathBuf::from("/data/models/DeepSeek-V4.1-Flash"),
+    ];
+    let snapshots = home.join(".cache/huggingface/hub/models--deepseek-ai--DeepSeek-V4.1-Flash-1017/snapshots");
+    if let Ok(entries) = std::fs::read_dir(&snapshots) {
+        let mut revisions: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+        revisions.sort();
+        candidates.extend(revisions);
+    }
+    candidates.into_iter().find(|dir| has_shards(dir))
+}
+
+pub fn has_shards(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|e| e.path().extension().map(|x| x == "safetensors").unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
 
 /// What the caller wants to know about the acquisition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
