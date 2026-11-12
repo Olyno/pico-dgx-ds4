@@ -51,6 +51,17 @@ fn same_filesystem(a: &Path, b: &Path) -> bool {
     matches!((device_of(a), device_of(b)), (Some(x), Some(y)) if x == y)
 }
 
+/// Bytes a kept path already occupies: a file's allocated blocks, or every file
+/// under a directory. A sparse `.part` counts only what it has written so far.
+fn allocated(p: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(m) = std::fs::metadata(p) else { return 0 };
+    if !m.is_dir() {
+        return m.blocks() * 512;
+    }
+    std::fs::read_dir(p).map(|e| e.flatten().map(|x| allocated(&x.path())).sum()).unwrap_or(0)
+}
+
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
 }
@@ -74,7 +85,7 @@ fn admit(
         return Ok(());
     }
     let mut msg = format!(
-        "{} has {:.1} GB free and this run writes {:.1} GB, then keeps {:.1} GB of headroom",
+        "{} has {:.1} GB free and this run still has to write {:.1} GB, then keeps {:.1} GB of headroom",
         out.display(),
         free as f64 / 1e9,
         need as f64 / 1e9,
@@ -462,6 +473,7 @@ fn prepare(
     } else {
         existing_outputs(o)
     };
+    let mut kept: Vec<PathBuf> = Vec::new();
     if !existing.is_empty() {
         let (keep, stale): (Vec<PathBuf>, Vec<PathBuf>) = if o.resume {
             existing.into_iter().partition(|p| keep_existing(&ck, o, p))
@@ -474,6 +486,7 @@ fn prepare(
                 keep.len()
             );
         }
+        kept = keep;
         if !stale.is_empty() {
             confirm_replace(&stale, replace);
             for p in &stale {
@@ -486,6 +499,18 @@ fn prepare(
         }
     }
 
+    // Bytes an earlier run already wrote are not written again: the space check
+    // must ask for the remainder, not for the whole set. Without this a resumed
+    // run was refused for a total that was already half on the disk.
+    let already: u64 = kept.iter().map(|p| allocated(p)).sum();
+    if already > 0 {
+        need = need.saturating_sub(already);
+        println!(
+            "[dsw-prepare] {:.1} GB of the output is already on disk, so {:.1} GB still has to be written",
+            already as f64 / 1e9,
+            need as f64 / 1e9
+        );
+    }
     // A hybrid run keeps one whole shard on disk while it converts it.
     if source == "hybrid" {
         need += ck.shards.iter().map(|s| s.size).filter(|&b| b <= HYBRID_MAX_CACHED).max().unwrap_or(0);
@@ -955,6 +980,22 @@ mod tests {
     }
 
     #[test]
+    fn kept_files_count_what_they_already_hold() {
+        let dir = std::env::temp_dir().join(format!("dsw-alloc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("engram")).unwrap();
+        std::fs::write(dir.join("rank0.dsw.part"), vec![2u8; 3 << 20]).unwrap();
+        std::fs::write(dir.join("engram/shard.dsweng"), vec![1u8; 1 << 20]).unwrap();
+        // A partial file is credited for what it holds, so the resume is not
+        // asked to fit the whole rank again.
+        assert!(allocated(&dir.join("rank0.dsw.part")) >= 3 << 20);
+        // A kept Engram directory credits every shard inside it.
+        assert!(allocated(&dir.join("engram")) >= 1 << 20);
+        assert_eq!(allocated(&dir.join("missing")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_whole_set_must_fit_without_consumption() {
         let out = Path::new("/data/out");
         assert!(admit(out, 400 * GB, 500 * GB, false, None, None).is_ok());
@@ -967,7 +1008,7 @@ mod tests {
             Some("the checkpoint and the outputs are on different filesystems"),
         )
         .unwrap_err();
-        assert!(e.contains("writes 404.0 GB"), "{e}");
+        assert!(e.contains("still has to write 404.0 GB"), "{e}");
         // Without a peak the message names the reason instead of offering
         // --consume as a fix that could not help.
         assert!(e.contains("on different filesystems"), "{e}");
