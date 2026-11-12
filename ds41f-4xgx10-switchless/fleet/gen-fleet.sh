@@ -54,9 +54,11 @@ die() { echo "gen-fleet: $*" >&2; exit 1; }
 [[ $GID_INDEX =~ ^[0-9]+$ ]] || die "GID_INDEX='$GID_INDEX' is not a number"
 [[ $LINK_BASE =~ ^[0-9]+$ ]] && [ $((LINK_BASE + 2 * TP - 1)) -le 255 ] || die "LINK_BASE='$LINK_BASE': 2*TP subnets must fit 192.168.0-255"
 
-read -r -a W <<< "${WORKERS:-}"
+# Rank 0 is the head and runs locally; the fleet names only ranks 1..TP-1, so
+# TP=2 takes one target (WORKER= is the same thing, as in MiaAI's recipe).
+read -r -a W <<< "${WORKERS:-${WORKER:-}}"
 [ "${#W[@]}" -eq $((TP - 1)) ] ||
-  die "WORKERS needs $((TP - 1)) ssh target(s) for TP=$TP (ranks 1..$((TP - 1))), got ${#W[@]}: WORKERS=\"user@host ...\""
+  die "WORKERS needs $((TP - 1)) ssh target(s) for TP=$TP (rank 0 is the head, local; ranks 1..$((TP - 1)) are remote), got ${#W[@]}: WORKERS=\"user@host ...\""
 
 # A value from the environment if set, else the generated one.
 pick() { local v="RANK$1_$2"; printf '%s' "${!v:-$3}"; }
