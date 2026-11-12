@@ -32,9 +32,11 @@ LOG_DIR=${LOG_DIR:-~/dsgb10/logs}
 SERVICE_DIR=${SERVICE_DIR:-~/dsgb10/service}
 RING_LOCK=${RING_LOCK:-/data/dsgb10/ring.lock}
 # Not ${WEIGHTS:-...}: the `}` of `{rank}` would close the expansion.
-[ -n "${WEIGHTS:-}" ] || WEIGHTS='~/dsgb10/weights/rank{rank}.dsw'
-HASHMAP=${HASHMAP:-~/dsgb10/engram/engram_hashmap.bin}
-ENGRAM=${ENGRAM:-~/dsv41-4x-ring/engram}
+# The directory dsw-prepare cuts into: rank 0 serves it in place, ./start.sh
+# ships the other ranks' three files from it.
+[ -n "${WEIGHTS:-}" ] || WEIGHTS='~/dsgb10/convert/rank{rank}.dsw'
+HASHMAP=${HASHMAP:-~/dsgb10/convert/engram/engram_hashmap.bin}
+ENGRAM=${ENGRAM:-~/dsgb10/convert/engram}
 SPILL=${SPILL:-~/dsgb10/spill}
 
 OUT=./fleet.conf PRINT=0 FORCE=0 PROBE=0
