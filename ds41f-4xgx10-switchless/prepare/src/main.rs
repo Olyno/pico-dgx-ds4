@@ -58,7 +58,14 @@ fn home() -> PathBuf {
 /// Whether the run may start, and why not when it may not. `peak` is what a
 /// consuming run would need at its high-water mark; without it, or without
 /// `--consume`, the whole output set has to fit.
-fn admit(out: &Path, need: u64, free: u64, consume: bool, peak: Option<u64>) -> Result<(), String> {
+fn admit(
+    out: &Path,
+    need: u64,
+    free: u64,
+    consume: bool,
+    peak: Option<u64>,
+    peak_why: Option<&str>,
+) -> Result<(), String> {
     let fits = match (consume, peak) {
         (true, Some(p)) => p + RESERVE <= free,
         _ => need + RESERVE <= free,
@@ -82,7 +89,13 @@ fn admit(out: &Path, need: u64, free: u64, consume: bool, peak: Option<u64>) -> 
             ". --consume would peak at {:.1} GB, which does not fit either",
             p as f64 / 1e9
         )),
-        None => {}
+        None => {
+            // Without a peak, say why: "run with --consume" would be advice that
+            // cannot help, and the reason is the part the reader cannot guess.
+            if let Some(why) = peak_why {
+                msg.push_str(&format!("; {why}, so --consume would free nothing here"));
+            }
+        }
     }
     msg.push_str("; --dest writes a rank to another disk, and --source hybrid keeps only one shard on this one");
     Err(msg)
@@ -491,10 +504,17 @@ fn prepare(
     // peak of (written - released) instead — computed whenever that could help,
     // which needs the outputs on the checkpoint's own filesystem.
     let free = space::free_bytes(&o.out).unwrap_or_else(|e| die(&format!("{}: {e}", o.out.display())));
-    let peak = if o.dest.is_empty() && source == "local" && same_filesystem(ckpt, &o.out) {
-        space::consume_peak(&ck, o.world, &o.ranks, o.engram).ok().map(|p| p + always)
+    let (peak, peak_why) = if o.dest.is_empty() && source == "local" && same_filesystem(ckpt, &o.out) {
+        match space::consume_peak(&ck, o.world, &o.ranks, o.engram).ok().map(|p| p + always) {
+            Some(p) => (Some(p), None),
+            None => (None, Some("the peak of this plan could not be computed")),
+        }
+    } else if !o.dest.is_empty() {
+        (None, Some("the outputs are written to other disks (--dest)"))
+    } else if source != "local" {
+        (None, Some("this run streams the checkpoint, so there is nothing on this disk to release"))
     } else {
-        None
+        (None, Some("the checkpoint and the outputs are on different filesystems"))
     };
     if o.consume {
         if let Some(p) = peak {
@@ -506,7 +526,7 @@ fn prepare(
             );
         }
     }
-    if let Err(e) = admit(&o.out, need, free, o.consume, peak) {
+    if let Err(e) = admit(&o.out, need, free, o.consume, peak, peak_why) {
         die(&e);
     }
 
@@ -937,10 +957,22 @@ mod tests {
     #[test]
     fn the_whole_set_must_fit_without_consumption() {
         let out = Path::new("/data/out");
-        assert!(admit(out, 400 * GB, 500 * GB, false, None).is_ok());
-        let e = admit(out, 404 * GB, 100 * GB, false, None).unwrap_err();
+        assert!(admit(out, 400 * GB, 500 * GB, false, None, None).is_ok());
+        let e = admit(
+            out,
+            404 * GB,
+            100 * GB,
+            false,
+            None,
+            Some("the checkpoint and the outputs are on different filesystems"),
+        )
+        .unwrap_err();
         assert!(e.contains("writes 404.0 GB"), "{e}");
-        assert!(!e.contains("--consume"), "nothing to offer without a peak: {e}");
+        // Without a peak the message names the reason instead of offering
+        // --consume as a fix that could not help.
+        assert!(e.contains("on different filesystems"), "{e}");
+        assert!(e.contains("--consume would free nothing here"), "{e}");
+        assert!(!e.contains("--consume fits"), "{e}");
     }
 
     #[test]
@@ -948,12 +980,12 @@ mod tests {
         let out = Path::new("/data/out");
         // The report from a two-rank run: 409 GB of files, 95 GB free, and a
         // consuming peak of one Engram shard's output.
-        let e = admit(out, 409 * GB, 95 * GB, false, Some(19 * GB)).unwrap_err();
+        let e = admit(out, 409 * GB, 95 * GB, false, Some(19 * GB), None).unwrap_err();
         assert!(e.contains("--consume fits"), "{e}");
         assert!(e.contains("peak is 19.0 GB"), "{e}");
-        assert!(admit(out, 409 * GB, 95 * GB, true, Some(19 * GB)).is_ok());
+        assert!(admit(out, 409 * GB, 95 * GB, true, Some(19 * GB), None).is_ok());
         // A peak that does not fit either is called out as such.
-        let e = admit(out, 409 * GB, 95 * GB, true, Some(300 * GB)).unwrap_err();
+        let e = admit(out, 409 * GB, 95 * GB, true, Some(300 * GB), None).unwrap_err();
         assert!(e.contains("does not fit either"), "{e}");
         assert!(e.contains("--dest"), "{e}");
     }
