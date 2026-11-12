@@ -128,7 +128,7 @@ if [ -n "${TP:-${DSGB10_TP:-}}" ] && [ "${TP:-$DSGB10_TP}" != "$derived_tp" ]; t
 fi
 export TP="$derived_tp" DSGB10_TP="$derived_tp"
 
-# A host path under $HOME is the same file at /root in the container.
+# Serving maps host home paths to /root; preparation preserves host paths.
 in_container() {
   case "$1" in
     "$HOME"/*) printf '/root/%s' "${1#"$HOME"/}" ;;
@@ -159,17 +159,18 @@ ensure_image() {
 # rank straight to a mounted path.
 # ./start.sh clear: the outputs of earlier runs, never the checkpoint. Offline, so
 # it cannot start a download by accident.
+# Keep HOME and its absolute path unchanged for both default and explicit paths.
 clear_outputs() {
   local ttyarg=() outarg=(--out "$OUT")
   [ -t 0 ] && ttyarg=(-it)
   for a in "$@"; do [ "$a" = "--out" ] && outarg=(); done
   log "clear: deleting the rank files, journals, Engram shards and scratch of earlier runs in $OUT"
   if [ "$DRY" = "1" ]; then
-    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root -v /data:/data \\"
+    echo "    docker run --rm ${ttyarg[*]} --network none -e HOME=$HOME -v $HOME:$HOME -v /data:/data \\"
     echo "      $IMAGE prepare/target/release/dsw-prepare clear ${outarg[*]} $*"
     return 0
   fi
-  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" -v /data:/data \
+  docker run --rm "${ttyarg[@]}" --network none -e "HOME=$HOME" -v "$HOME:$HOME" -v /data:/data \
     "$IMAGE" prepare/target/release/dsw-prepare clear "${outarg[@]}" "$@" || die "clear failed"
 }
 
@@ -213,7 +214,7 @@ prepare() {
   # --cpu-shares, not --cpus: the conversion takes every core while the box is
   # idle and steps aside when something else wants them (a third of the CPU).
   local cmd=(docker run --rm "${ttyarg[@]}" --ipc=host --network host --cpu-shares 512
-    -v "$HOME:/root" -v /data:/data -w /work/ds41f-4xgx10-switchless "${envarg[@]}")
+    -e "HOME=$HOME" -v "$HOME:$HOME" -v /data:/data -w /work/ds41f-4xgx10-switchless "${envarg[@]}")
   if [ "$DRY" = "1" ]; then
     echo "    ${cmd[*]} $IMAGE prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${outarg[*]} ${args[*]}"
     return 0

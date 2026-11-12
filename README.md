@@ -174,6 +174,10 @@ none of those opens, then cuts every rank's `.dsw` and its Engram shards into th
 weight file in, verifies every tensor against the checkpoint, writes the hash map and copies the `tokenizer.json` beside
 the artefacts. Serving needs those artefacts plus that tokenizer — not the checkpoint.
 
+Preparation and `clear` mount `$HOME` and `/data` at their original host paths and preserve `HOME` inside the container.
+Use paths under those mounts for `--ckpt`, `--out`, `--dest` and `--vision-dir`; they refer to the same files on the host
+and in the preparation container, not its disposable writable layer.
+
 Where the bytes come from is chosen automatically: a checkpoint that is already complete and opens is used in place; otherwise
 `dsw-prepare` downloads through the hybrid source — each ordinary shard whole, one at a time, deleted after it is converted, and
 the two 101.5 GB Engram shards by range, so they never touch the disk. `--source local|http|hybrid` forces one.
@@ -188,6 +192,11 @@ parts at `127.0.0.1:18950`. The encoder runs from a torch/PIL image — built fr
 Outputs that belong to another checkpoint or world are never reused: `./start.sh` replaces them, and an explicit
 `prepare` lists them and asks on the terminal first. The space a run needs is computed from the plan, not from an
 environment variable, and it refuses to start when the filesystem cannot hold the outputs plus headroom.
+
+In hybrid mode the reported write budget includes the selected ranks and one cached source shard, not a second full
+checkpoint. `--consume` can reclaim only the local checkpoint being read; it does not delete an unused download or
+unrelated files. This free-space check is not an enforced 600 GB total-storage ceiling, and the full-model peak has
+not been verified against that limit.
 
 Extra arguments go to `dsw-prepare`:
 
