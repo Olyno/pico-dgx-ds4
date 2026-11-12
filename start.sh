@@ -8,39 +8,30 @@
 # resume, nothing is asked. Stop with ./stop.sh. Settings come from ./.env (or
 # $ENV_FILE), then the environment.
 #
-#   ./start.sh                 all of the above (nothing to do when it serves)
-#   ./start.sh serve           the container only; the files must be in place
-#   ./start.sh restart         stop, then all of the above
-#   ./start.sh status          exit 0 serving, 1 not
-#   ./start.sh prepare [ARGS]  only the files, by dsw-prepare; ARGS pass through to
-#                              it (--consume, --source local|http|hybrid, --clear,
-#                              --replace, --dest R=DIR, ...)
-#   ./start.sh clear           delete the rank files, journals, Engram shards and
-#                              scratch of earlier runs, keeping the checkpoint
-#                              (prepare --clear does the same, then converts)
-#   ./start.sh reshard --world N   re-cut an existing rank set for another TP from
-#                              the rank files alone (no checkpoint, no network, no
-#                              GPU): --from DIR (default the artifact directory),
-#                              --to DIR (default ~/dsgb10/convert-tpN). The engine
-#                              still serves TP=4 only, so this is for trying other
-#                              splits.
-#   ./start.sh fleet           write the fleet file from TP + WORKERS (fleet/gen-fleet.sh)
-#   ./start.sh --help
-#   DRY_RUN=1 ./start.sh       print every command, change nothing
-#   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
-# The default run streams the checkpoint as it converts (--consume): 507 GB of
-# model and 508 GB of rank files do not fit one disk. To keep the checkpoint,
-# run ./start.sh prepare without --consume first; it then refuses if it cannot.
+#   ./start.sh            all of the above; nothing to do when it already serves
+#   ./start.sh status     exit 0 while it serves, 1 otherwise
+#   ./start.sh restart    stop, then all of the above
+#   ./start.sh clear      delete earlier artifacts (never the checkpoint)
+#   ./start.sh prepare    the artifacts only, with these overrides:
+#       --world N         cut N ranks instead of the fleet's (1, 2 or 4; not 3)
+#       --consume         release the checkpoint as its outputs verify
+#       --ckpt DIR        a checkpoint somewhere other than the ones searched
+#       --source S        local | hybrid | http (the default takes the local one)
+#   DRY_RUN=1 ./start.sh  print every command, change nothing
+#
+# Settings come from ./.env: FLEET (the rank list and the paths) and, if the fleet
+# is not written yet, WORKERS (the other boxes). The rank count is not a setting:
+# rank 0 is the head and every ssh target in WORKERS is one more, so the fleet's
+# four ranks are what `./start.sh` cuts. The engine loads world 4 only today
+# (engine/common/tp.h); the cutter takes the worlds the model allows, 1, 2 and 4.
 #
 # The artifacts live where the fleet puts rank 0's weight file (RANK0_WEIGHTS):
 # rank 0 reads them there, so nothing is copied on the head; its Engram shards and
 # the hash map sit beside it, under engram/.
 #
-# The rank count is not a setting: rank 0 is the head and every ssh target in
-# WORKERS is one more rank, so WORKERS="u@a u@b u@c" is a four-rank ring, and a
-# generated fleet file names exactly the same ranks. The engine's kernels and ring
-# are TP=4 specialised: prepare cuts --world N files and ./start.sh reshard re-cuts
-# an existing set, but dsgb10_rank refuses TP != 4 (engine/common/tp.h).
+# The default run streams the checkpoint as it converts (--consume): 507 GB of
+# model and 508 GB of rank files do not fit one disk. `./start.sh prepare` keeps
+# it unless you pass --consume, and refuses instead of half-filling the disk.
 set -euo pipefail
 cd "$(dirname "$0")"
 REPO="$(pwd)"
@@ -120,17 +111,10 @@ elif [ "$fleet_ranks" -gt 0 ]; then
   derived_tp=$fleet_ranks
 fi
 [ "$derived_tp" -gt 0 ] || derived_tp=4
-# TP=... (or DSGB10_TP) still wins when you set it: that is the knob, and the
-# cutter takes every world the model's shapes allow (1, 2, 4; not 3 — 5120 and
-# the 64 heads do not divide by it). What you cannot do yet is *serve* a world
-# other than 4: the kernels, the ring and the Engram store are built for it
-# (engine/common/tp.h), and the run says so before starting instead of after.
-explicit_tp="${TP:-${DSGB10_TP:-}}"
-if [ -n "$explicit_tp" ]; then
-  if [ "$explicit_tp" != "$derived_tp" ]; then
-    warn "TP=$explicit_tp overrides the $derived_tp rank(s) WORKERS/the fleet name: ranks $explicit_tp..$((derived_tp - 1)) are ignored"
-  fi
-  derived_tp=$explicit_tp
+# There is no TP to set: the boxes you name are the rank count, and the engine is
+# told the same number. Cutting another world on purpose is `prepare --world N`.
+if [ -n "${TP:-${DSGB10_TP:-}}" ] && [ "${TP:-$DSGB10_TP}" != "$derived_tp" ]; then
+  warn "ignoring TP=${TP:-$DSGB10_TP} from .env: the rank count is the boxes you name ($derived_tp) — remove the line"
 fi
 export TP="$derived_tp" DSGB10_TP="$derived_tp"
 
@@ -321,24 +305,6 @@ ensure_artifacts() {
   log "artifacts: all $TP rank(s) in place in $OUT ($maxc Engram shard(s) each)"
 }
 
-# ./start.sh reshard: re-cut a finished rank set for another world. Offline by
-# construction (`--network none`): every byte comes from the old files, and the
-# default source is the artifact directory the fleet names.
-reshard() {
-  local ttyarg=() args=("$@") fromarg=(--from "$OUT") a
-  [ -t 0 ] && ttyarg=(-it)
-  for a in "$@"; do [ "$a" = "--from" ] && fromarg=(); done
-  log "reshard: re-cutting the rank set in $OUT inside the container (no checkpoint, no network)"
-  if [ "$DRY" = "1" ]; then
-    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root -v /data:/data \\"
-    echo "      $IMAGE prepare/target/release/dsw-prepare reshard ${fromarg[*]} ${args[*]}"
-    return 0
-  fi
-  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" -v /data:/data \
-    -w /work/ds41f-4xgx10-switchless \
-    "$IMAGE" prepare/target/release/dsw-prepare reshard "${fromarg[@]}" "${args[@]}" || die "reshard failed"
-}
-
 # The image encoder is a side process on rank 0 (docs/vision.md): it imports the
 # checkpoint's own inference/vision.py, so it needs torch, PIL and safetensors —
 # an image of its own, named by VISION_IMAGE, not the engine image.
@@ -367,10 +333,12 @@ start_vision() {
 MODE=run
 FORCE_STOP=0
 case "${1:-}" in
+  -h | --help | help) usage; exit 0 ;;
+  "" | -*) ;;  # no command: a run, and the rest are engine flags
   run | start) shift ;;
   restart) FORCE_STOP=1; shift ;;
-  serve | status | fleet | prepare | clear | reshard) MODE=$1; shift ;;
-  -h | --help | help) usage; exit 0 ;;
+  status | prepare | clear) MODE=$1; shift ;;
+  *) die "'$1' is not a command (./start.sh --help): ./start.sh [status|restart|clear|prepare] [engine flags]" ;;
 esac
 for arg in "$@"; do
   case "$arg" in -h | --help) usage; exit 0 ;; esac
@@ -382,21 +350,21 @@ done
 # another world on the way to serving would spend hours on files no build can
 # load, so the default run refuses; ./start.sh prepare --world N still can, on
 # purpose (and says so).
-if [ "$TP" != "4" ] && [ "$MODE" != "prepare" ] && [ "$MODE" != "reshard" ]; then
-  die "TP=$TP, but the engine loads TP=4 only (engine/common/tp.h), so files cut at $TP could never be served.
-  TP follows the boxes you name: put three ssh targets in WORKERS, or let the fleet file name
-  ranks 1..3 (WORKERS=\"u@a u@b u@c\"). For another split on purpose: ./start.sh prepare --world N"
+if [ "$TP" != "4" ] && [ "$MODE" != "prepare" ]; then
+  die "the engine loads TP=4 only (engine/common/tp.h), so $TP rank(s) could never be served.
+  The rank count follows the boxes you name: put three ssh targets in WORKERS, or let the
+  fleet file name ranks 1..3. For another split on purpose: ./start.sh prepare --world N"
 fi
 
-# ./start.sh fleet: write the fleet file from TP + WORKERS instead of hand-editing it.
-if [ "$MODE" = "fleet" ]; then
-  exec "$REPO/ds41f-4xgx10-switchless/fleet/gen-fleet.sh" \
-    --out "${FLEET_ENV:-$REPO/fleet.conf}" "$@"
-fi
-
-# A clear or a reshard only touches files: no fleet, no GPU, no checkpoint.
-if [ "$MODE" != "clear" ] && [ "$MODE" != "reshard" ]; then
-  [ -f "$FLEET" ] || die "fleet file $FLEET not found (./start.sh fleet generates one from TP and WORKERS, or set FLEET=FILE)"
+# A clear only touches files: no fleet, no GPU, no checkpoint.
+if [ "$MODE" != "clear" ]; then
+  # WORKERS alone is enough: the fleet file is written from it the first time.
+  if [ ! -f "$FLEET" ]; then
+    [ -n "${WORKERS:-${WORKER:-}}" ] || die "no fleet file $FLEET and no WORKERS: set WORKERS=\"u@a u@b u@c\" in .env"
+    "$REPO/ds41f-4xgx10-switchless/fleet/gen-fleet.sh" --out "$FLEET" >/dev/null ||
+      die "could not write $FLEET from WORKERS"
+    log "fleet: wrote $FLEET from WORKERS"
+  fi
   for ((r = 1; r < TP; r++)); do
     grep -q "^RANK${r}_SSH=" "$FLEET" || die "fleet file $FLEET has no RANK${r}_SSH (TP=$TP needs ranks 0..$((TP - 1)))"
   done
@@ -446,20 +414,11 @@ if [ "$MODE" = "clear" ]; then
   clear_outputs "$@"
   exit 0
 fi
-if [ "$MODE" = "reshard" ]; then
-  reshard "$@"
-  exit 0
-fi
-
 # ---------------------------------------------------------------- 2. artifacts
 # The whole install, skipped when the fleet's paths already hold it: cut the rank
 # files, Engram shards and hash map (the tool decides the checkpoint and the
 # source), then ship the other ranks' three files.
-if [ "$MODE" = "run" ]; then
-  ensure_artifacts
-else
-  log "serve: using the files in $OUT as they are"
-fi
+ensure_artifacts
 
 # ---------------------------------------------------------------- 3. files
 if [ "$NO_AUTH" = "1" ]; then

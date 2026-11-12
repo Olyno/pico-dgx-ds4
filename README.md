@@ -146,31 +146,31 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 ## ✧ run it
 
 **In a container (one command).** `./start.sh` builds the image from [Dockerfile](Dockerfile) (engine + front-end,
-`sm_121a`), starts `engine/server/service.sh` inside a host-networked GPU container and waits until the API answers;
-`./stop.sh` stops it and frees the GPU. Settings come from `.env` (see [.env.example](.env.example)): `TP`, `FLEET`,
-`WORKERS`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`, `VISION`. The rank count
-is not among them: it is `1 + the WORKERS targets`.
+`sm_121a`), takes the checkpoint that is already here (or streams it from the Hub), cuts every rank's `.dsw`, its Engram
+shards and the hash map, ships the other ranks' three files to the boxes the fleet names, starts
+`engine/server/service.sh` inside a host-networked GPU container, waits until the API answers and runs a smoke test.
+`./stop.sh` stops it and frees the GPU. Run it again after an interruption: finished ranks are kept, unfinished ones
+resume, nothing is asked. Settings come from `.env` (see [.env.example](.env.example)): `FLEET`, and `WORKERS` only
+when the fleet file does not exist yet.
 
 ```bash
-cp .env.example .env && $EDITOR .env     # WORKERS (three targets = four ranks), port
-./start.sh fleet                         # write the fleet file from WORKERS (no hand-editing)
-./start.sh prepare                       # once, rank 0: checkpoint (if missing) + rank files + Engram shards
-./start.sh                               # docker build + service start + smoke test
+cp .env.example .env && $EDITOR .env     # FLEET; WORKERS if the fleet is not written yet
+./start.sh                               # everything; a second run is a no-op while it serves
 ./start.sh status                        # exit 0 while serving
 ./stop.sh                                # graceful stop, then remove the container
 ```
 
-`./start.sh fleet` derives the rank count, per-rank paths and the ring's link addresses from
-`WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs. The count
-is the list: three targets are a four-rank ring, because rank 0 is the head and runs locally. The API key
+The rank count is the box list, not a setting: rank 0 is the head and every `WORKERS` target is one more rank, so
+three targets are the four-rank ring. `fleet/gen-fleet.sh` writes the fleet file from it on the first run — per-rank
+paths and the ring's link addresses included; only the RDMA device names and `GID_INDEX` stay inputs. The API key
 is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
 
-`./start.sh prepare` is the one-time setup on rank 0, run by `dsw-prepare`
-(`ds41f-4xgx10-switchless/prepare`, Rust, CPU only — it does not need the GPU). It looks for the checkpoint at
-`~/DeepSeek-V4.1-Flash-1017` and downloads it **only** when it is missing or a shard is short, then cuts every rank's
-`.dsw` and its Engram shards into `~/dsgb10/convert`, verifies every tensor against the checkpoint, writes the hash map
-and copies the `tokenizer.json` beside the artefacts. `start` needs those artefacts plus that tokenizer — not the
-checkpoint — so it never downloads anything by itself.
+The cutting is done by `dsw-prepare` (`ds41f-4xgx10-switchless/prepare`, Rust, CPU only — it does not need the GPU),
+which `./start.sh` runs by itself and only when a rank's files are not already in place. It looks for the checkpoint in
+`~/DeepSeek-V4.1-Flash-1017`, `~/DeepSeek-V4.1-Flash`, `/data/models/*` and the Hub cache, downloads it **only** when
+none of those opens, then cuts every rank's `.dsw` and its Engram shards into the directory the fleet puts rank 0's
+weight file in, verifies every tensor against the checkpoint, writes the hash map and copies the `tokenizer.json` beside
+the artefacts. Serving needs those artefacts plus that tokenizer — not the checkpoint.
 
 Where the bytes come from is chosen automatically: a checkpoint that is already complete and opens is used in place; otherwise
 `dsw-prepare` downloads through the hybrid source — each ordinary shard whole, one at a time, deleted after it is converted, and
@@ -182,51 +182,37 @@ released and vision still works. It also points dsfront at `127.0.0.1:18950`; `V
 makes `start.sh` run `tools/vision/vision_encoder.py` from that bundle. `VISION=0` (the default) refuses image parts, as before.
 Enabling it later costs at most a re-download of those 2.3 GB, never the 510 GB checkpoint.
 
-Outputs an earlier run left behind are never overwritten silently: `prepare` lists them and asks on the terminal
-(`--replace` answers for a script); answering no stops the run. The space it needs is computed from the plan, not from
-an environment variable, and it refuses to start when the filesystem cannot hold the outputs plus headroom.
+Outputs that belong to another checkpoint or world are never reused: `./start.sh` replaces them, and an explicit
+`prepare` lists them and asks on the terminal first. The space a run needs is computed from the plan, not from an
+environment variable, and it refuses to start when the filesystem cannot hold the outputs plus headroom.
 
 Extra arguments go to `dsw-prepare`:
 
 | argument | what it does |
 |---|---|
-| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run. The space it needs is the run's **peak** — one shard's outputs, not the whole set — and the checkpoint cannot be kept afterwards (its payload is gone, while the headers and the blocks at every tensor's edges stay, so it can still be opened and a killed run resumed) |
-| `--clear` (or `./start.sh clear`) | deletes every output an earlier run left in the destination — rank files, `.part` writes, journals, the Engram shards and the hybrid scratch — and nothing else; with `prepare` it then converts. It never touches the checkpoint |
-| `--source http` | streams the checkpoint through HTTP ranges instead of storing it (only the batch in flight is on disk) |
-| `--source hybrid` | downloads each ordinary shard (7.4 GB) whole into `scratch/`, converts it, deletes it, and reads the two 101.5 GB Engram shards by range; one shard of extra peak instead of ~96,000 range requests |
-| `--dest R=DIR` | writes rank R straight into a mounted directory (a worker's disk over NFS), instead of staging and copying |
-| `--replace` | skips the "delete these outputs?" prompt |
-| `--no-verify` | skips the read-back comparison (faster, and it removes the guarantee) |
+| `--world N` | cuts N ranks instead of the fleet's (the model allows 1, 2 and 4; 3 does not divide). The default run always cuts the fleet's |
+| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run. The space it needs is the run's **peak** — one shard's outputs, not the whole set. The default run does this; without it the checkpoint is kept and the run refuses if both cannot fit |
+| `--ckpt DIR` | the checkpoint, when it is not in one of the places searched (`~/DeepSeek-V4.1-Flash[-1017]`, `/data/models/*`, the Hub cache) |
+| `--source local\|hybrid\|http` | where the bytes come from; the default uses the local checkpoint when it opens, and otherwise the hybrid stream (each ordinary shard whole and deleted after conversion, the two 101.5 GB Engram shards by range) |
 
 Every batch is journaled (`rank<r>.dsw.journal`) after its outputs are written, verified and synced, so an interrupted
-run resumes where it stopped and a crash cannot leave a tensor committed but unreadable. Re-running the same command
-keeps those files and continues (`--no-resume` starts over; `--clear` deletes them first). The run prints a line per rank
-per shard — tensors done, bytes written, bytes released, elapsed and an estimate — and the Engram tables report every
-10 %. `dsw-prepare status --out DIR` prints each rank's commits, and `dsw-prepare verify --ckpt DIR --file FILE`
-re-derives every tensor from the TOC's own description and compares it with the checkpoint.
-
-**Another split (experimental).** `./start.sh reshard --world 2` re-cuts a finished set for a different tensor-parallel
-degree using the rank files alone: no checkpoint, no download, no GPU (the container runs with `--network none`). It
-reads each old rank's tiled bytes, un-tiles them, copies the rectangles the new split owns, tiles those with the new
-geometry and reads every tensor back before the file is renamed into place; the old Engram shards are re-cut the same way,
-by rows. `--from`/`--to` default to `~/dsgb10/convert` and `~/dsgb10/convert-tpN`, and a 4 → 2 → 4 round trip reproduces
-the original files tensor for tensor.
-
-The engine itself serves TP=4 only (`engine/common/tp.h`), so the output of a reshard is for a build whose kernels and
-ring take that world; what exists today is the files, and their bytes are the checkpoint's own.
+run resumes where it stopped and a crash cannot leave a tensor committed but unreadable. A second run keeps the finished
+ranks and continues the others; `./start.sh clear` deletes every output an earlier run left (rank files, `.part` writes,
+journals, the Engram shards, the hybrid scratch) and never the checkpoint. The run prints a line per rank per shard —
+tensors done, bytes written, bytes released, elapsed and an estimate — and the Engram tables report every 10 %.
 
 The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
 work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.
 `service.sh` still copies the engine binary and the confidence-gate weights to ranks 1..TP−1 over ssh, so those boxes
 need the same CUDA driver and `rdma-core` (a container on rank 0 only is not enough).
 
-**Tensor parallelism.** The degree is derived, not configured: rank 0 is the head, `WORKERS` names ranks 1..N-1, so
-`TP = 1 + the targets` (and a fleet file names the same ranks; if both are present they must agree). `prepare` cuts
-`--world $TP` rank files, `./start.sh prepare --world N` cuts a different world on purpose, and the `reshard` mode
-re-cuts an existing set for another world without the checkpoint. The engine's kernels and ring are specialised to TP=4, so
-`dsgb10_rank` refuses any other value with a message naming the fix (`engine/common/tp.h`) instead of computing
-garbage; the per-rank shapes all derive from `model::kRanks` (`engine/model/config.h`), which is the one place a
-generalisation starts.
+**Tensor parallelism.** The degree is the box list, not a setting: rank 0 plus the `WORKERS` targets, and the fleet file
+names the same ranks. `./start.sh prepare --world N` cuts another world on purpose. The engine loads world 4 today:
+`engine/common/tp.h` refuses any other value with a message naming the fix instead of computing garbage, because the
+kernels (per-rank shapes derived from `model::kRanks`, `engine/model/config.h`), the ring (quarter reduce-scatter with
+an opposite-rank relay, `engine/comm/ring.cpp`) and the Engram store (`engine/engram/engram.h`) are built for it.
+Worlds 1 and 2 would also need a box that holds one rank's weights — 507 GB and 254 GB — against 128 GB per GB10;
+world 3 is not a split this model allows (its rows do not divide by 3).
 
 This is the exact build behind the numbers above (the engine source in this repo is the source of the binary we serve).
 
