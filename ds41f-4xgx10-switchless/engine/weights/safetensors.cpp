@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstring>
 #include <set>
+#include <unordered_set>
 
 #include "weights/io.h"
 
@@ -234,8 +235,24 @@ Checkpoint Checkpoint::open(const std::string& dir) {
     Json idx = Json::parse(read_text(idx_path));
     const Json* wm = idx.get("weight_map");
     if (!wm) die("%s has no weight_map", idx_path.c_str());
-    if (wm->obj.size() != ck.tensors.size())
-      die("index names %zu tensors, shards hold %zu", wm->obj.size(), ck.tensors.size());
+    if (wm->obj.size() != ck.tensors.size()) {
+      // A partial download is the usual cause, so name what is missing instead of only counting it.
+      std::unordered_set<std::string> idx;
+      idx.reserve(wm->obj.size());
+      for (const auto& kv : wm->obj) idx.insert(kv.first);
+      std::string miss, extra;
+      size_t nm = 0, ne = 0;
+      for (const auto& kv : wm->obj)
+        if (!ck.tensors.count(kv.first) && ++nm <= 8) miss += (miss.empty() ? "" : ", ") + kv.first;
+      for (const auto& kv : ck.tensors)
+        if (!idx.count(kv.first) && ++ne <= 8) extra += (extra.empty() ? "" : ", ") + kv.first;
+      die("index names %zu tensors, shards hold %zu (%zu shard files in %s)\n"
+          "  in the index, in no shard (%zu): %s\n"
+          "  in a shard, not in the index (%zu): %s\n"
+          "  a partial download is the usual cause: re-run it into %s",
+          wm->obj.size(), ck.tensors.size(), ck.shards.size(), dir.c_str(), nm, miss.empty() ? "-" : miss.c_str(),
+          ne, extra.empty() ? "-" : extra.c_str(), dir.c_str());
+    }
     for (auto& [name, file] : wm->obj) {
       auto it = ck.tensors.find(name);
       if (it == ck.tensors.end()) die("index names %s, which no shard holds", name.c_str());
