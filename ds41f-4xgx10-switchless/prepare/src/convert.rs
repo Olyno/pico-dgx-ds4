@@ -23,7 +23,7 @@ use crate::engram::{self, Table};
 use crate::journal::{Journal, OutputCommit, Record};
 use crate::plan::{self, OutTensor, Plan};
 use crate::safetensors::{Checkpoint, SrcTensor};
-use crate::source::{ShardSource, Source};
+use crate::source::Reader;
 use crate::tile;
 
 #[derive(Debug, Clone)]
@@ -147,9 +147,9 @@ fn assemble(o: &OutTensor, ck: &Checkpoint, buffers: &HashMap<usize, Vec<u8>>) -
     nat
 }
 
-fn read_tensor(src: &dyn Source, t: &SrcTensor) -> std::io::Result<Vec<u8>> {
+fn read_tensor(reader: &dyn Reader, t: &SrcTensor) -> std::io::Result<Vec<u8>> {
     let mut buf = vec![0u8; t.bytes as usize];
-    src.read_at(t.offset, &mut buf)?;
+    reader.read_at(t.shard, t.offset, &mut buf)?;
     Ok(buf)
 }
 
@@ -314,7 +314,7 @@ fn open_rank(ck: &Checkpoint, o: &Options, rank: u32) -> Result<RankState, Strin
 }
 
 /// Runs the conversion for the ranks in `o.ranks`, shard by shard.
-pub fn run(ck: &Checkpoint, shards: &[ShardSource], o: &Options, source_note: &str) -> Result<(), String> {
+pub fn run(ck: &Checkpoint, reader: &dyn Reader, o: &Options, source_note: &str) -> Result<(), String> {
     let mut states: Vec<RankState> = Vec::new();
     for &r in &o.ranks {
         states.push(open_rank(ck, o, r)?);
@@ -364,7 +364,10 @@ pub fn run(ck: &Checkpoint, shards: &[ShardSource], o: &Options, source_note: &s
     }
 
     for &shard in &order {
-        let src = &shards[shard];
+        reader.prepare(shard).map_err(|e| format!("{}: prepare: {e}", ck.shards[shard].name))?;
+        // The scratch copy a hybrid reader fetched goes away even if this shard
+        // fails, so a retry starts from a known state.
+        let _guard = ShardGuard(reader, shard);
         // 1. The batches whose last source is in this shard.
         for b in batches.iter().filter(|b| b.at == shard) {
             if b.consumers.iter().all(|(ri, oi)| states[*ri].committed.contains(&states[*ri].plan.tensors[*oi].name)) {
@@ -373,8 +376,7 @@ pub fn run(ck: &Checkpoint, shards: &[ShardSource], o: &Options, source_note: &s
             let mut buffers: HashMap<usize, Vec<u8>> = HashMap::new();
             for &s in &b.srcs {
                 let t = &ck.tensors[s];
-                let from = &shards[t.shard];
-                buffers.insert(s, read_tensor(from.as_source(), t).map_err(|e| format!("{}: read: {e}", t.name))?);
+                buffers.insert(s, read_tensor(reader, t).map_err(|e| format!("{}: read: {e}", t.name))?);
             }
             for &(ri, oi) in &b.consumers {
                 let st = &mut states[ri];
@@ -408,7 +410,7 @@ pub fn run(ck: &Checkpoint, shards: &[ShardSource], o: &Options, source_note: &s
                 if st.committed.contains(&batch) {
                     continue;
                 }
-                write_engram(ck, st, table, src.as_source(), o)?;
+                write_engram(ck, st, table, reader, o)?;
                 st.journal
                     .append(&Record::Commit {
                         batch: batch.clone(),
@@ -429,15 +431,14 @@ pub fn run(ck: &Checkpoint, shards: &[ShardSource], o: &Options, source_note: &s
         //    whole shard truncated, which is only safe because nothing in it is
         //    read again.
         if o.consume && fully_consumed(ck, shard, &tables, &states) {
-            let Some(local) = src.local() else { continue };
             for &ti in &ck.shards[shard].tensors {
                 let t = &ck.tensors[ti];
                 let start = t.offset / ALIGN * ALIGN;
                 let end = align_up(t.offset + t.bytes, ALIGN);
-                match local.punch(start, end - start) {
+                match reader.release(shard, start, end - start) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                        local.truncate_tail(0).map_err(|e| format!("{}: release: {e}", t.name))?;
+                        reader.truncate(shard, 0).map_err(|e| format!("{}: release: {e}", t.name))?;
                         break;
                     }
                     Err(e) => return Err(format!("{}: release: {e}", t.name)),
@@ -457,6 +458,15 @@ pub fn run(ck: &Checkpoint, shards: &[ShardSource], o: &Options, source_note: &s
     Ok(())
 }
 
+/// Runs `finish` on the reader whatever happens to the shard.
+struct ShardGuard<'a>(&'a dyn Reader, usize);
+
+impl Drop for ShardGuard<'_> {
+    fn drop(&mut self) {
+        self.0.finish(self.1);
+    }
+}
+
 fn fully_consumed(ck: &Checkpoint, shard: usize, tables: &[Table], states: &[RankState]) -> bool {
     for st in states {
         for ot in &st.plan.tensors {
@@ -473,7 +483,7 @@ fn fully_consumed(ck: &Checkpoint, shard: usize, tables: &[Table], states: &[Ran
     true
 }
 
-fn write_engram(ck: &Checkpoint, st: &mut RankState, table: &Table, src: &dyn Source, o: &Options) -> Result<(), String> {
+fn write_engram(ck: &Checkpoint, st: &mut RankState, table: &Table, reader: &dyn Reader, o: &Options) -> Result<(), String> {
     let path = engram_path(o, st.rank, table.layer);
     if let Some(d) = path.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -497,8 +507,12 @@ fn write_engram(ck: &Checkpoint, st: &mut RankState, table: &Table, src: &dyn So
         let n = (hi - row).min(chunk_rows);
         let mut weight = vec![0u8; (n * engram::WEIGHT_BYTES) as usize];
         let mut scale = vec![0u8; (n * engram::SCALE_BYTES) as usize];
-        src.read_at(w.offset + row * engram::WEIGHT_BYTES, &mut weight).map_err(|e| format!("{}: {e}", w.name))?;
-        src.read_at(s.offset + row * engram::SCALE_BYTES, &mut scale).map_err(|e| format!("{}: {e}", s.name))?;
+        reader
+            .read_at(w.shard, w.offset + row * engram::WEIGHT_BYTES, &mut weight)
+            .map_err(|e| format!("{}: {e}", w.name))?;
+        reader
+            .read_at(s.shard, s.offset + row * engram::SCALE_BYTES, &mut scale)
+            .map_err(|e| format!("{}: {e}", s.name))?;
         let mut recs = vec![0u8; (n * engram::ROW_BYTES) as usize];
         for k in 0..n as usize {
             let a = k * engram::WEIGHT_BYTES as usize;

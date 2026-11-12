@@ -12,7 +12,7 @@ use dsw_prepare::dsw::{Header, ALIGN, HEADER_BYTES};
 use dsw_prepare::engram;
 use dsw_prepare::journal::{Journal, Record};
 use dsw_prepare::safetensors::Checkpoint;
-use dsw_prepare::source::{LocalFile, ShardSource};
+use dsw_prepare::source::{HttpRange, HybridReader, LocalReader};
 
 /// Writes one safetensors shard: `u64` header length, the JSON header, the bytes.
 /// Deliberately its own implementation, so the reader is tested against a writer
@@ -100,14 +100,9 @@ fn out_dir(tag: &str) -> PathBuf {
     d
 }
 
-fn open_shards(ck: &Checkpoint) -> Vec<ShardSource> {
-    ck.shards
-        .iter()
-        .map(|s| {
-            let p = s.path.as_ref().expect("local");
-            ShardSource::Local(LocalFile::open(p).unwrap())
-        })
-        .collect()
+fn reader(ck: &Checkpoint) -> LocalReader {
+    let paths: Vec<PathBuf> = ck.shards.iter().map(|s| s.path.clone().expect("local")).collect();
+    LocalReader::open(&paths).unwrap()
 }
 
 fn options(out: &Path, consume: bool) -> Options {
@@ -130,9 +125,8 @@ fn converts_all_ranks_and_every_output_verifies() {
     write_checkpoint(&ckdir);
     let out = out_dir("out");
     let ck = Checkpoint::open(&ckdir).unwrap();
-    let shards = open_shards(&ck);
     let o = options(&out, false);
-    convert::run(&ck, &shards, &o, &ckdir.display().to_string()).unwrap();
+    convert::run(&ck, &reader(&ck), &o, &ckdir.display().to_string()).unwrap();
 
     for r in 0..4u32 {
         let f = convert::dsw_path(&o, r);
@@ -187,7 +181,7 @@ fn a_crash_before_the_last_commit_replays_only_that_batch() {
     let out = out_dir("out-resume");
     let ck = Checkpoint::open(&ckdir).unwrap();
     let o = options(&out, false);
-    convert::run(&ck, &open_shards(&ck), &o, "test").unwrap();
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
     for r in 0..4u32 {
         convert::verify_file(&ck, &convert::dsw_path(&o, r)).unwrap();
     }
@@ -207,7 +201,7 @@ fn a_crash_before_the_last_commit_replays_only_that_batch() {
     let (_, state) = Journal::load(&convert::journal_path(&o, 0)).unwrap();
     assert!(!state.done);
 
-    convert::run(&ck, &open_shards(&ck), &o, "test").unwrap();
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
     for r in 0..4u32 {
         convert::verify_file(&ck, &convert::dsw_path(&o, r)).unwrap();
         let (_, state) = Journal::load(&convert::journal_path(&o, r)).unwrap();
@@ -231,7 +225,7 @@ fn consume_releases_the_source_and_the_outputs_still_match() {
         .map(|s| File::open(s.path.as_ref().unwrap()).unwrap().metadata().unwrap().blocks())
         .collect();
     let o = options(&out, true);
-    convert::run(&ck, &open_shards(&ck), &o, "test").unwrap();
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
 
     let after: Vec<u64> = ck
         .shards
@@ -260,7 +254,7 @@ fn consuming_requires_every_rank() {
     let ck = Checkpoint::open(&ckdir).unwrap();
     let mut o = options(&out, true);
     o.ranks = vec![0];
-    let err = convert::run(&ck, &open_shards(&ck), &o, "test").unwrap_err();
+    let err = convert::run(&ck, &reader(&ck), &o, "test").unwrap_err();
     assert!(err.contains("every rank"), "{err}");
     let _ = std::fs::remove_dir_all(&ckdir);
     let _ = std::fs::remove_dir_all(&out);
@@ -273,12 +267,12 @@ fn a_tampered_output_fails_verification() {
     let out = out_dir("out-tamper");
     let ck = Checkpoint::open(&ckdir).unwrap();
     let o = options(&out, false);
-    convert::run(&ck, &open_shards(&ck), &o, "test").unwrap();
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
     let f = convert::dsw_path(&o, 0);
     // Flip one byte inside the first tensor's data.
     let meta = f.metadata().unwrap();
     let mut buf = [0u8; 1];
-    let mut fh = std::fs::OpenOptions::new().read(true).write(true).open(&f).unwrap();
+    let fh = std::fs::OpenOptions::new().read(true).write(true).open(&f).unwrap();
     fh.read_exact_at(&mut buf, ALIGN).unwrap();
     buf[0] ^= 0xFF;
     fh.write_all_at(&buf, ALIGN).unwrap();
@@ -297,8 +291,8 @@ fn a_second_run_refuses_to_overwrite_a_finished_file() {
     let out = out_dir("out-twice");
     let ck = Checkpoint::open(&ckdir).unwrap();
     let o = options(&out, false);
-    convert::run(&ck, &open_shards(&ck), &o, "test").unwrap();
-    let err = convert::run(&ck, &open_shards(&ck), &o, "test").unwrap_err();
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
+    let err = convert::run(&ck, &reader(&ck), &o, "test").unwrap_err();
     assert!(err.contains("already complete"), "{err}");
     let _ = std::fs::remove_dir_all(&ckdir);
     let _ = std::fs::remove_dir_all(&out);
@@ -311,9 +305,78 @@ fn the_journal_begin_record_is_written_before_any_output() {
     let out = out_dir("out-begin");
     let ck = Checkpoint::open(&ckdir).unwrap();
     let o = options(&out, false);
-    convert::run(&ck, &open_shards(&ck), &o, "test").unwrap();
+    convert::run(&ck, &reader(&ck), &o, "test").unwrap();
     let (records, _) = Journal::load(&convert::journal_path(&o, 2)).unwrap();
     assert!(matches!(records.first(), Some(Record::Begin { rank: 2, world: 4, .. })));
+    let _ = std::fs::remove_dir_all(&ckdir);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn hybrid_downloads_whole_shards_and_leaves_no_scratch() {
+    use std::io::{Read, Write};
+
+    let ckdir = out_dir("ck-hybrid");
+    write_checkpoint(&ckdir);
+    let out = out_dir("out-hybrid");
+    let scratch = out.join("scratch");
+
+    // The shards served as whole files: a hybrid run downloads each once instead
+    // of issuing a request per tensor.
+    let bodies: Vec<(String, Vec<u8>)> = std::fs::read_dir(&ckdir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "safetensors").unwrap_or(false))
+        .map(|e| (e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap()))
+        .collect();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = bodies.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let Ok(mut s) = s else { continue };
+            let mut req = [0u8; 2048];
+            let n = s.read(&mut req).unwrap_or(0);
+            let text = String::from_utf8_lossy(&req[..n]).to_string();
+            let path = text.split_whitespace().nth(1).unwrap_or("/").trim_start_matches('/').to_string();
+            match served.iter().find(|(name, _)| *name == path) {
+                Some((_, body)) => {
+                    let head =
+                        format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    let _ = s.write_all(head.as_bytes());
+                    let _ = s.write_all(body);
+                }
+                None => {
+                    let _ = s.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                }
+            }
+        }
+    });
+
+    // The plan comes from the headers alone, as it does in a streaming run.
+    let mut items = Vec::new();
+    let mut remote = Vec::new();
+    let mut names = Vec::new();
+    for (name, body) in &bodies {
+        let (len, header) = dsw_prepare::safetensors::parse_header(body).unwrap();
+        items.push((name.clone(), len, header));
+        remote.push(HttpRange::new(format!("http://{addr}/{name}"), body.len() as u64, None, 2));
+        names.push(name.clone());
+    }
+    let ck = Checkpoint::from_shard_headers(items).unwrap();
+    let reader = HybridReader::new(remote, names, scratch.clone(), 64 << 20);
+    let o = options(&out, false);
+    convert::run(&ck, &reader, &o, "http").unwrap();
+
+    let clean = Checkpoint::open(&ckdir).unwrap();
+    for r in 0..4u32 {
+        convert::verify_file(&clean, &convert::dsw_path(&o, r)).unwrap();
+    }
+    let left: Vec<String> = std::fs::read_dir(&scratch)
+        .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().into_owned()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "the scratch still holds {left:?}");
+
     let _ = std::fs::remove_dir_all(&ckdir);
     let _ = std::fs::remove_dir_all(&out);
 }

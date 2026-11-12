@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use dsw_prepare::convert::{self, Options};
 use dsw_prepare::plan;
 use dsw_prepare::safetensors::Checkpoint;
-use dsw_prepare::source::{hub_url, HttpRange, LocalFile, ShardSource, Source};
+use dsw_prepare::source::{hub_url, HttpRange, HttpReader, HybridReader, LocalReader, Reader, Source};
 use dsw_prepare::space;
 
 const REPO: &str = "deepseek-ai/DeepSeek-V4.1-Flash-1017";
@@ -23,6 +23,10 @@ const REV: &str = "1bae0e10";
 /// Headroom the run must leave on the output filesystem: metadata, journals,
 /// filesystem overhead, and the last tensor in flight.
 const RESERVE: u64 = 10 << 30;
+
+/// The largest shard a hybrid run downloads whole. Above it (the two 101.5 GB
+/// Engram tables) the shard is read by range instead, which keeps it off the disk.
+const HYBRID_MAX_CACHED: u64 = 16 << 30;
 
 fn die(msg: &str) -> ! {
     eprintln!("[dsw-prepare] ERROR: {msg}");
@@ -100,8 +104,8 @@ fn main() {
             "--rank" => rank = Some(arg(&args, &mut i, a).parse().unwrap_or_else(|_| die("--rank: not a number"))),
             "--source" => {
                 let v = arg(&args, &mut i, a);
-                if v != "local" && v != "http" {
-                    die("--source is local or http");
+                if !matches!(v, "local" | "http" | "hybrid") {
+                    die("--source is local, http or hybrid");
                 }
                 source = v.into();
             }
@@ -201,17 +205,28 @@ fn main() {
 }
 
 fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoint: &str, replace: bool) {
-    let (ck, shards, note) = if source == "http" {
-        let (ck, shards) = http_checkpoint(endpoint, repo, rev);
-        (ck, shards, format!("{endpoint}/{repo}@{rev}"))
-    } else {
-        let ck = ensure_checkpoint(ckpt, repo, rev);
-        let mut shards = Vec::new();
-        for s in &ck.shards {
-            let p = s.path.as_ref().expect("a local checkpoint has paths");
-            shards.push(ShardSource::Local(LocalFile::open(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())))));
+    let (ck, reader, note): (Checkpoint, Box<dyn Reader>, String) = match source {
+        "http" | "hybrid" => {
+            let (ck, remote, names) = http_checkpoint(endpoint, repo, rev);
+            let note = format!("{endpoint}/{repo}@{rev}");
+            if source == "http" {
+                (ck, Box::new(HttpReader::new(remote)), note)
+            } else {
+                let scratch = convert::dir_for(o, o.ranks[0]).join("scratch");
+                println!(
+                    "[dsw-prepare] hybrid: whole shards up to {:.1} GB, ranges above; scratch in {}",
+                    HYBRID_MAX_CACHED as f64 / 1e9,
+                    scratch.display()
+                );
+                (ck, Box::new(HybridReader::new(remote, names, scratch, HYBRID_MAX_CACHED)), note)
+            }
         }
-        (ck, shards, ckpt.display().to_string())
+        _ => {
+            let ck = ensure_checkpoint(ckpt, repo, rev);
+            let paths: Vec<PathBuf> = ck.shards.iter().map(|s| s.path.clone().expect("a local checkpoint has paths")).collect();
+            let r = LocalReader::open(&paths).unwrap_or_else(|e| die(&format!("opening the shards: {e}")));
+            (ck, Box::new(r), ckpt.display().to_string())
+        }
     };
 
 
@@ -248,6 +263,11 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
         }
     }
 
+    // A hybrid run keeps one whole shard on disk while it converts it.
+    if source == "hybrid" {
+        need += ck.shards.iter().map(|s| s.size).filter(|&b| b <= HYBRID_MAX_CACHED).max().unwrap_or(0);
+    }
+
     // Admission: the outputs must fit, plus the reserve. A local source is already
     // allocated, so it is not added again; --consume only frees it later.
     let free = space::free_bytes(&o.out).unwrap_or_else(|e| die(&format!("{}: {e}", o.out.display())));
@@ -262,7 +282,7 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
         ));
     }
 
-    convert::run(&ck, &shards, o, &note).unwrap_or_else(|e| die(&e));
+    convert::run(&ck, reader.as_ref(), o, &note).unwrap_or_else(|e| die(&e));
     if let Err(e) = &hashmap(&ck, o) {
         eprintln!("[dsw-prepare] WARN: the Engram hash map was not written: {e}");
     }
@@ -312,7 +332,7 @@ fn ensure_checkpoint(ckpt: &Path, repo: &str, rev: &str) -> Checkpoint {
 }
 
 /// The plan and the sources for a run that never stores the checkpoint.
-fn http_checkpoint(endpoint: &str, repo: &str, rev: &str) -> (Checkpoint, Vec<ShardSource>) {
+fn http_checkpoint(endpoint: &str, repo: &str, rev: &str) -> (Checkpoint, Vec<HttpRange>, Vec<String>) {
     let token = std::env::var("HF_TOKEN").ok();
     let fetch = |url: &str, len: u64| -> Vec<u8> {
         let s = HttpRange::new(url.to_string(), len, token.clone(), 3);
@@ -351,11 +371,11 @@ fn http_checkpoint(endpoint: &str, repo: &str, rev: &str) -> (Checkpoint, Vec<Sh
         s.read_at(0, &mut raw).unwrap_or_else(|e| die(&format!("{url}: {e}")));
         let (len, header) = dsw_prepare::safetensors::parse_header(&raw).unwrap_or_else(|e| die(&format!("{name}: {e}")));
         items.push((name.clone(), len, header));
-        sources.push(ShardSource::Http(s));
+        sources.push(s);
     }
     println!("[dsw-prepare] {} shards described from the Hub; nothing stored locally", items.len());
     let ck = Checkpoint::from_shard_headers(items).unwrap_or_else(|e| die(&e));
-    (ck, sources)
+    (ck, sources, names)
 }
 
 fn existing_outputs(o: &Options) -> Vec<PathBuf> {

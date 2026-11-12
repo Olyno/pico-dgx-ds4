@@ -13,7 +13,8 @@
 #                              only when it is not already complete), then every rank's .dsw
 #                              and its Engram shards. ARGS go to dsw-prepare: --consume
 #                              releases the checkpoint's blocks as the outputs land,
-#                              --source http streams it instead of storing it, --replace
+#                              --source http streams it instead of storing it,
+#                              --source hybrid caches one whole shard at a time, --replace
 #                              skips the "delete these?" prompt, --dest R=DIR writes a rank
 #                              straight to a mounted path
 #   ./start.sh --help

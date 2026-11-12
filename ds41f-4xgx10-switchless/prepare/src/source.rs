@@ -12,7 +12,7 @@
 use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::space;
@@ -24,26 +24,198 @@ pub trait Source {
     fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()>;
 }
 
-/// One shard, either on disk (where its blocks can be released) or remote.
-pub enum ShardSource {
-    Local(LocalFile),
-    Http(HttpRange),
+/// Reads the checkpoint's shards, whichever way they are stored.
+///
+/// `prepare` is where a hybrid implementation fetches a whole file, and `finish`
+/// is where it drops it, so the caller only has to bracket a shard.
+pub trait Reader {
+    fn prepare(&self, shard: usize) -> io::Result<()> {
+        let _ = shard;
+        Ok(())
+    }
+
+    fn read_at(&self, shard: usize, off: u64, buf: &mut [u8]) -> io::Result<()>;
+
+    /// Releases `[off, off+len)` when this reader's copy is local. A remote copy
+    /// has nothing to free.
+    fn release(&self, shard: usize, off: u64, len: u64) -> io::Result<()> {
+        let _ = (shard, off, len);
+        Ok(())
+    }
+
+    /// Frees the whole copy of `shard`, for a filesystem whose `release` cannot
+    /// punch holes.
+    fn truncate(&self, shard: usize, len: u64) -> io::Result<()> {
+        let _ = (shard, len);
+        Ok(())
+    }
+
+    /// Drops what `prepare` left on disk.
+    fn finish(&self, shard: usize) {
+        let _ = shard;
+    }
 }
 
-impl ShardSource {
-    pub fn as_source(&self) -> &dyn Source {
-        match self {
-            ShardSource::Local(l) => l,
-            ShardSource::Http(h) => h,
+/// Every shard on disk: the plain local case, and the one `--consume` frees.
+pub struct LocalReader {
+    shards: Vec<LocalFile>,
+}
+
+impl LocalReader {
+    pub fn open(paths: &[PathBuf]) -> io::Result<LocalReader> {
+        Ok(LocalReader { shards: paths.iter().map(|p| LocalFile::open(p)).collect::<io::Result<_>>()? })
+    }
+}
+
+impl Reader for LocalReader {
+    fn read_at(&self, shard: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.shards[shard].read_at(off, buf)
+    }
+
+    fn release(&self, shard: usize, off: u64, len: u64) -> io::Result<()> {
+        self.shards[shard].punch(off, len)
+    }
+
+    fn truncate(&self, shard: usize, len: u64) -> io::Result<()> {
+        self.shards[shard].truncate_tail(len)
+    }
+}
+
+/// Every shard read by HTTP range: nothing is stored, only the tensor in flight.
+pub struct HttpReader {
+    shards: Vec<HttpRange>,
+}
+
+impl HttpReader {
+    pub fn new(shards: Vec<HttpRange>) -> HttpReader {
+        HttpReader { shards }
+    }
+}
+
+impl Reader for HttpReader {
+    fn read_at(&self, shard: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        self.shards[shard].read_at(off, buf)
+    }
+}
+
+/// Whole small shards on disk, ranges for the large ones.
+///
+/// One shard is resident at a time (the one being converted), so the peak grows by
+/// its size and nothing else; it is deleted as soon as that shard is done. A shard
+/// above `max_cached` (the Engram tables) is never downloaded — it is read by
+/// range, which keeps its 101.5 GB off the disk entirely.
+pub struct HybridReader {
+    remote: Vec<HttpRange>,
+    names: Vec<String>,
+    scratch: PathBuf,
+    max_cached: u64,
+    cached: std::sync::Mutex<Option<(usize, PathBuf, LocalFile)>>,
+}
+
+impl HybridReader {
+    pub fn new(remote: Vec<HttpRange>, names: Vec<String>, scratch: PathBuf, max_cached: u64) -> HybridReader {
+        HybridReader { remote, names, scratch, max_cached, cached: std::sync::Mutex::new(None) }
+    }
+
+    fn drop_cached(&self) {
+        let mut c = self.cached.lock().unwrap();
+        if let Some((_, path, _)) = c.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl Reader for HybridReader {
+    fn prepare(&self, shard: usize) -> io::Result<()> {
+        {
+            let c = self.cached.lock().unwrap();
+            if matches!(&*c, Some((s, _, _)) if *s == shard) {
+                return Ok(());
+            }
+        }
+        self.drop_cached();
+        let len = self.remote[shard].len();
+        if len > self.max_cached {
+            return Ok(()); // read by range instead
+        }
+        std::fs::create_dir_all(&self.scratch)?;
+        let path = self.scratch.join(&self.names[shard]);
+        download_to(self.remote[shard].url(), &path, len, self.remote[shard].token(), 3)?;
+        let local = LocalFile::open(&path)?;
+        *self.cached.lock().unwrap() = Some((shard, path, local));
+        Ok(())
+    }
+
+    fn read_at(&self, shard: usize, off: u64, buf: &mut [u8]) -> io::Result<()> {
+        let c = self.cached.lock().unwrap();
+        match &*c {
+            Some((s, _, local)) if *s == shard => local.read_at(off, buf),
+            _ => {
+                drop(c);
+                self.remote[shard].read_at(off, buf)
+            }
         }
     }
 
-    /// Only a local shard has blocks to release.
-    pub fn local(&self) -> Option<&LocalFile> {
-        match self {
-            ShardSource::Local(l) => Some(l),
-            ShardSource::Http(_) => None,
+    fn release(&self, shard: usize, off: u64, len: u64) -> io::Result<()> {
+        let c = self.cached.lock().unwrap();
+        match &*c {
+            Some((s, _, local)) if *s == shard => local.punch(off, len),
+            _ => Ok(()),
         }
+    }
+
+    fn truncate(&self, shard: usize, len: u64) -> io::Result<()> {
+        let c = self.cached.lock().unwrap();
+        match &*c {
+            Some((s, _, local)) if *s == shard => local.truncate_tail(len),
+            _ => Ok(()),
+        }
+    }
+
+    fn finish(&self, shard: usize) {
+        let is_current = {
+            let c = self.cached.lock().unwrap();
+            matches!(&*c, Some((s, _, _)) if *s == shard)
+        };
+        if is_current {
+            self.drop_cached();
+        }
+    }
+}
+
+/// Downloads one file, resuming a partial one, and checks its size.
+pub fn download_to(url: &str, path: &Path, expect: u64, token: Option<&str>, retries: u32) -> io::Result<()> {
+    if let Ok(m) = std::fs::metadata(path) {
+        if expect != 0 && m.len() == expect {
+            return Ok(());
+        }
+    }
+    let mut attempt = 0;
+    loop {
+        let mut cmd = Command::new("curl");
+        cmd.args(["-sSfL", "-C", "-", "--max-filesize", &(expect + 1).to_string(), "-o"]).arg(path);
+        if let Some(t) = token {
+            cmd.args(["-H", &format!("Authorization: Bearer {t}")]);
+        }
+        cmd.arg(url);
+        let out = cmd.output()?;
+        if out.status.success() {
+            let got = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            if expect == 0 || got == expect {
+                return Ok(());
+            }
+            // A resumed transfer that overshot or stalled: start over once.
+            let _ = std::fs::remove_file(path);
+        }
+        if attempt >= retries {
+            return Err(io::Error::other(format!(
+                "{url}: download failed after {attempt} retries: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        attempt += 1;
+        std::thread::sleep(std::time::Duration::from_millis(500 << (attempt - 1).min(4)));
     }
 }
 
@@ -126,6 +298,14 @@ pub struct HttpRange {
 impl HttpRange {
     pub fn new(url: String, len: u64, token: Option<String>, retries: u32) -> HttpRange {
         HttpRange { url, len, token, retries }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
     }
 
     fn once(&self, off: u64, buf: &mut [u8]) -> io::Result<()> {
