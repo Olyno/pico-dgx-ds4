@@ -1,5 +1,5 @@
 // Sparse attention over a row's window and its selected compressed entries (MQA: one 512-wide latent
-// per key serves all 16 local heads as both K and V). Online softmax in blocks of 64 keys as the
+// per key serves every head of a pass as both K and V). Online softmax in blocks of 64 keys as the
 // reference's tilelang kernel: running max from -1e30, fp32 P summed, P rounded to bf16 for PV, the
 // sink added to the denominator at the end. Keys are dequantised to bf16 in shared memory (exactly:
 // e4m3 x 2^k and e2m1 x e4m3 both fit bf16) and multiplied with bf16 mma.sync m16n8k16.
@@ -18,7 +18,12 @@ constexpr int kRowS = kHead + 8;  // padded smem row (bf16 elements): 16 B shift
 constexpr int kPS = kBlk + 8;
 constexpr int kWinBlocks = kWindow / kBlk;
 constexpr int kWinBlocksMax = 3;     // with explicit bounds: up to 192 window keys (DSpark: 128 main + the 5 drafts)
-constexpr size_t kAttnSmem = (size_t)(kHeads + kBlk) * kRowS * 2 + kHeads * kPS * 2 + 2 * 4 * kHeads * 4 + kBlk * 4;
+// Query heads one launch computes. The mapping below is 16 heads: a lane holds heads g and g + 8 of the
+// pass, and the mma's 16 rows are those heads. A rank with more heads (world 2: 32, world 1: 64) runs the
+// same kernel once per slice with a head offset, so every world keeps this mapping and no second kernel
+// exists to drift from it. World 8 would have 8 heads per rank, which this mma cannot express.
+constexpr int kPass = 16;
+constexpr size_t kAttnSmem = (size_t)(kPass + kBlk) * kRowS * 2 + kPass * kPS * 2 + 2 * 4 * kPass * 4 + kBlk * 4;
 
 __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
   uint32_t a = (uint32_t)__cvta_generic_to_shared(p);
@@ -52,6 +57,7 @@ struct AttnArgs {
   int kmax;
   const float* sink;
   float scale;
+  int hbase;  // the first of this pass's heads, in the rank's own head range
   int nwin, nblocks, per_split, splits;
   uint16_t* out;
   float* po;
@@ -79,11 +85,12 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
   pdl_trigger();
   if (threadIdx.x < 16) e2m1_lut[threadIdx.x] = e2m1_to_f(threadIdx.x);
   pdl_wait();
-  uint16_t* qs = reinterpret_cast<uint16_t*>(smem_raw);  // [16][kRowS]
-  uint16_t* ks = qs + kHeads * kRowS;                    // [64][kRowS]
-  uint16_t* ps = ks + kBlk * kRowS;                      // [16][kPS]
-  float* red = reinterpret_cast<float*>(ps + kHeads * kPS);  // [2][4][16]
-  int* kvalid = reinterpret_cast<int*>(red + 2 * 4 * kHeads);
+  uint16_t* qs = reinterpret_cast<uint16_t*>(smem_raw);  // [kPass][kRowS]
+  uint16_t* ks = qs + kPass * kRowS;                     // [64][kRowS]
+  uint16_t* ps = ks + kBlk * kRowS;                      // [kPass][kPS]
+  float* red = reinterpret_cast<float*>(ps + kPass * kPS);  // [2][4][kPass]
+  int* kvalid = reinterpret_cast<int*>(red + 2 * 4 * kPass);
+  const int hb = a.hbase;  // this pass's heads are hb .. hb + kPass, the rank's own
   int r = blockIdx.y, split = blockIdx.x;
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
   int p = a.pos[r];
@@ -93,10 +100,10 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
   const float2* tb = a.table + (size_t)p * 32;
   const uint16_t* qrow = a.q + (size_t)r * kHeads * kHead;
 #pragma unroll
-  for (int it = 0; it < kHeads * kHead / 8 / 128; ++it) {  // every load in flight at once
+  for (int it = 0; it < kPass * kHead / 8 / 128; ++it) {  // every load in flight at once
     int i = threadIdx.x + 128 * it;
     int h = i >> 6, c = (i & 63) * 8;
-    uint4 v = *reinterpret_cast<const uint4*>(qrow + h * kHead + c);
+    uint4 v = *reinterpret_cast<const uint4*>(qrow + (hb + h) * kHead + c);
     if (c >= kHead - kRope) {
       uint32_t w[4] = {v.x, v.y, v.z, v.w};
 #pragma unroll
@@ -209,15 +216,15 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
       mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, o2));
     }
     if (t == 0) {
-      red[warp * kHeads + g] = mx0;
-      red[warp * kHeads + g + 8] = mx1;
+      red[warp * kPass + g] = mx0;
+      red[warp * kPass + g + 8] = mx1;
     }
     __syncthreads();
     float mn0 = m0, mn1 = m1;
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
-      mn0 = fmaxf(mn0, red[w * kHeads + g]);
-      mn1 = fmaxf(mn1, red[w * kHeads + g + 8]);
+      mn0 = fmaxf(mn0, red[w * kPass + g]);
+      mn1 = fmaxf(mn1, red[w * kPass + g + 8]);
     }
     float sum0 = 0.f, sum1 = 0.f;
 #pragma unroll
@@ -236,16 +243,16 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
       sum1 = __fadd_rn(sum1, __shfl_xor_sync(0xffffffffu, sum1, o2));
     }
     if (t == 0) {
-      red[4 * kHeads + warp * kHeads + g] = sum0;
-      red[4 * kHeads + warp * kHeads + g + 8] = sum1;
+      red[4 * kPass + warp * kPass + g] = sum0;
+      red[4 * kPass + warp * kPass + g + 8] = sum1;
     }
     __syncthreads();
     float al0 = expf(__fsub_rn(m0, mn0)), al1 = expf(__fsub_rn(m1, mn1));
     float bs0 = 0.f, bs1 = 0.f;
 #pragma unroll
     for (int w = 0; w < 4; ++w) {
-      bs0 = __fadd_rn(bs0, red[4 * kHeads + w * kHeads + g]);
-      bs1 = __fadd_rn(bs1, red[4 * kHeads + w * kHeads + g + 8]);
+      bs0 = __fadd_rn(bs0, red[4 * kPass + w * kPass + g]);
+      bs1 = __fadd_rn(bs1, red[4 * kPass + w * kPass + g + 8]);
     }
     l0 = __fadd_rn(__fmul_rn(l0, al0), bs0);
     l1 = __fadd_rn(__fmul_rn(l1, al1), bs1);
@@ -273,14 +280,15 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
     }
   }
   if (a.splits == 1) {
-    float d0 = __fadd_rn(l0, expf(__fsub_rn(a.sink[g], m0))), d1 = __fadd_rn(l1, expf(__fsub_rn(a.sink[g + 8], m1)));
+    float d0 = __fadd_rn(l0, expf(__fsub_rn(a.sink[hb + g], m0)));
+    float d1 = __fadd_rn(l1, expf(__fsub_rn(a.sink[hb + g + 8], m1)));
     uint16_t* orow = a.out + (size_t)r * kHeads * kHead;
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
       int d = warp * 128 + i * 8 + 2 * t;
-      *reinterpret_cast<uint32_t*>(orow + g * kHead + d) =
+      *reinterpret_cast<uint32_t*>(orow + (hb + g) * kHead + d) =
           finish_pair(__fdiv_rn(o[i][0], d0), __fdiv_rn(o[i][1], d0), d, tb);
-      *reinterpret_cast<uint32_t*>(orow + (g + 8) * kHead + d) =
+      *reinterpret_cast<uint32_t*>(orow + (hb + g + 8) * kHead + d) =
           finish_pair(__fdiv_rn(o[i][2], d1), __fdiv_rn(o[i][3], d1), d, tb);
     }
   } else {
@@ -288,12 +296,12 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
 #pragma unroll
     for (int i = 0; i < 16; ++i) {
       int d = warp * 128 + i * 8 + 2 * t;
-      *reinterpret_cast<float2*>(a.po + (base + g) * kHead + d) = make_float2(o[i][0], o[i][1]);
-      *reinterpret_cast<float2*>(a.po + (base + g + 8) * kHead + d) = make_float2(o[i][2], o[i][3]);
+      *reinterpret_cast<float2*>(a.po + (base + hb + g) * kHead + d) = make_float2(o[i][0], o[i][1]);
+      *reinterpret_cast<float2*>(a.po + (base + hb + g + 8) * kHead + d) = make_float2(o[i][2], o[i][3]);
     }
     if (warp == 0 && t == 0) {
-      *reinterpret_cast<float2*>(a.pml + (base + g) * 2) = make_float2(m0, l0);
-      *reinterpret_cast<float2*>(a.pml + (base + g + 8) * 2) = make_float2(m1, l1);
+      *reinterpret_cast<float2*>(a.pml + (base + hb + g) * 2) = make_float2(m0, l0);
+      *reinterpret_cast<float2*>(a.pml + (base + hb + g + 8) * 2) = make_float2(m1, l1);
     }
   }
 }
@@ -302,8 +310,8 @@ __global__ void __launch_bounds__(128) attn_kernel(AttnArgs a) {
 // before the PDL wait)
 __global__ void __launch_bounds__(128) attn_combine_kernel(const float* po, const float* pml, const float* sink,
                                                            const int* pos, const float2* table, int splits,
-                                                           uint16_t* out) {
-  int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x * 4;
+                                                           uint16_t* out, int hbase) {
+  int r = blockIdx.x, h = hbase + blockIdx.y, d = threadIdx.x * 4;
   pdl_trigger();
   float sk = sink[h];
   pdl_wait();
@@ -339,13 +347,13 @@ __global__ void __launch_bounds__(128) attn_combine_kernel(const float* po, cons
 void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, const float2* table, Window win,
                  Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, int splits,
                  AttnScratch scratch, cudaStream_t s, bool pdl) {
-  // attn_kernel's mapping is 16 query heads per rank: 4 warps of 128 dims, each lane group holding heads
-  // g and g + 8. That is the four-box world's slice (64 / 4); another world's heads per rank need another
-  // mapping, so this refuses instead of computing another world's attention.
-  if (kHeads != 16)
-    die("attn: sparse_attn is built for 16 query heads per rank (world 4); this engine is built for world %d "
-        "(%d heads per rank), whose attention kernel is not written yet",
-        world::kWorld, kHeads);
+  // attn_kernel's mapping is kPass (16) query heads: 4 warps of 128 dims, each lane group holding heads
+  // g and g + 8. A rank with more heads runs that same kernel once per slice with a head offset, and every
+  // head is computed by the same code whatever the world. World 8 would leave 8 heads per rank, which the
+  // 16-row mma cannot express, so that one is refused rather than half-computed.
+  if (kHeads % kPass != 0)
+    die("attn: sparse_attn needs the rank's heads in multiples of %d; world %d gives %d heads per rank",
+        kPass, world::kWorld, kHeads);
   static bool once = [] {
     CUDA_CHECK(cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kAttnSmem));
     return true;
@@ -374,12 +382,15 @@ void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, 
   a.out = out;
   a.po = scratch.o;
   a.pml = scratch.ml;
-  launch(attn_kernel, dim3(a.splits, rows), dim3(128), kAttnSmem, s, pdl, a);
-  CUDA_CHECK(cudaGetLastError());
-  if (a.splits > 1) {
-    launch(attn_combine_kernel, dim3(rows, kHeads), dim3(kHead / 4), 0, s, pdl, (const float*)scratch.o,
-           (const float*)scratch.ml, sink, pos, table, a.splits, out);
+  for (int hb = 0; hb < kHeads; hb += kPass) {  // one launch per 16 heads; world 4 is a single pass
+    a.hbase = hb;
+    launch(attn_kernel, dim3(a.splits, rows), dim3(128), kAttnSmem, s, pdl, a);
     CUDA_CHECK(cudaGetLastError());
+    if (a.splits > 1) {
+      launch(attn_combine_kernel, dim3(rows, kPass), dim3(kHead / 4), 0, s, pdl, (const float*)scratch.o,
+             (const float*)scratch.ml, sink, pos, table, a.splits, out, hb);
+      CUDA_CHECK(cudaGetLastError());
+    }
   }
 }
 

@@ -36,6 +36,10 @@ constexpr int kBlk = 64;      // keys per block
 constexpr int kMaxK = 512;    // compressed entries per row
 constexpr float kLazy = 8.0f;  // P may reach e^8 before the reference max moves
 
+// Query heads one launch computes, as attn::sparse_attn's kPass: the mma's M is 16 heads. A rank with more
+// heads (world 2: 32, world 1: 64) runs the same kernel once per slice with a head offset.
+constexpr int kPass = 16;
+static_assert(kHeads % kPass == 0, "the rank's heads must come in multiples of the 16-row mma");
 constexpr int kCodeB = kBlk * 512;  // a block's packed keys, 512 B (fp8) or 256 B (fp4) per key row
 constexpr int kSclB = kBlk * 32;    // scales, 16 B (fp8) or 32 B (fp4) per key
 constexpr int kPS = kBlk + 8;       // P row stride (halves)
@@ -43,11 +47,11 @@ constexpr int kOffCode = 0;
 constexpr int kOffScl = kOffCode + 2 * kCodeB;
 constexpr int kOffValid = kOffScl + 2 * kSclB;
 constexpr int kOffQ = kOffValid + 2 * kBlk;
-constexpr int kOffTk = kOffQ + kHeads * kHead * 2;
+constexpr int kOffTk = kOffQ + kPass * kHead * 2;
 constexpr int kOffSx = kOffTk + kMaxK * 4;
 constexpr int kOffRed = kOffSx + 8 * 32 * 8 * 4;
-constexpr int kOffP = kOffRed + 2 * 4 * kHeads * 4;
-constexpr int kOffTab = kOffP + kHeads * kPS * 2;  // RoPE cos/sin of dims 448..511 at a row's pos, 2 slots
+constexpr int kOffP = kOffRed + 2 * 4 * kPass * 4;
+constexpr int kOffTab = kOffP + kPass * kPS * 2;  // RoPE cos/sin of dims 448..511 at a row's pos, 2 slots
 constexpr int kSmem = kOffTab + 2 * (kRope / 2) * 8;
 static_assert(kSmem <= 101376, "shared memory");
 
@@ -66,6 +70,7 @@ struct PArgs {
   attn::Compressed ckv;
   const int* topk;
   int kmax, nb, win_lo;
+  int hbase;  // the first of this pass's heads, in the rank's own head range
   const float* sink;
   float scale;
   uint16_t* out;
@@ -112,8 +117,9 @@ __device__ __forceinline__ void issue_block(const PArgs& a, uint8_t* sm, int p, 
 // row r's q, and its RoPE table row (pos p) into table slot `slot`
 __device__ __forceinline__ void issue_q(const PArgs& a, uint8_t* sm, int r, int p, int slot) {
   const uint8_t* src = reinterpret_cast<const uint8_t*>(a.q + (size_t)r * kHeads * kHead);
-  for (int i = threadIdx.x; i < kHeads * 64; i += kThreads)
-    pa::cp16(sm + kOffQ + (i >> 6) * 1024 + qswz(i >> 6, i & 63) * 16, src + i * 16, true);
+  for (int i = threadIdx.x; i < kPass * 64; i += kThreads)
+    pa::cp16(sm + kOffQ + (i >> 6) * 1024 + qswz(i >> 6, i & 63) * 16,
+             src + ((size_t)a.hbase + (i >> 6)) * kHead * 2 + (i & 63) * 16, true);
   if (threadIdx.x < kRope / 4)
     pa::cp16(sm + kOffTab + slot * kRope * 4 + threadIdx.x * 16,
              reinterpret_cast<const uint8_t*>(a.table + (size_t)p * 32) + threadIdx.x * 16, true);
@@ -271,7 +277,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
   const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, kg = w >> 1, dg = w & 1, g = lane >> 2, t = lane & 3;
   float* sx = reinterpret_cast<float*>(sm + kOffSx);
   float* red_m = reinterpret_cast<float*>(sm + kOffRed);
-  float* red_l = red_m + 4 * kHeads;
+  float* red_l = red_m + 4 * kPass;
   uint16_t* ps = reinterpret_cast<uint16_t*>(sm + kOffP);
   const int G = gridDim.x;
   const int nrows = a.rows > (int)blockIdx.x ? (a.rows - 1 - (int)blockIdx.x) / G + 1 : 0;
@@ -352,8 +358,8 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
       mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, x));
     }
     if (dg == 0 && t == 0) {
-      red_m[kg * kHeads + g] = mx0;
-      red_m[kg * kHeads + g + 8] = mx1;
+      red_m[kg * kPass + g] = mx0;
+      red_m[kg * kPass + g + 8] = mx1;
     }
     // P = exp(s - m) rounded to bf16 into ps (dim half 0 writes), block sums of the fp32 p into red_l
     auto make_p = [&](float mm0, float mm1) {
@@ -376,8 +382,8 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
         sum1 = __fadd_rn(sum1, __shfl_xor_sync(0xffffffffu, sum1, x));
       }
       if (dg == 0 && t == 0) {
-        red_l[kg * kHeads + g] = sum0;
-        red_l[kg * kHeads + g + 8] = sum1;
+        red_l[kg * kPass + g] = sum0;
+        red_l[kg * kPass + g + 8] = sum1;
       }
     };
     if (b > 0) make_p(m0, m1);
@@ -385,8 +391,8 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
       float bm0 = red_m[g], bm1 = red_m[g + 8];
 #pragma unroll
       for (int q = 1; q < 4; ++q) {
-        bm0 = fmaxf(bm0, red_m[q * kHeads + g]);
-        bm1 = fmaxf(bm1, red_m[q * kHeads + g + 8]);
+        bm0 = fmaxf(bm0, red_m[q * kPass + g]);
+        bm1 = fmaxf(bm1, red_m[q * kPass + g + 8]);
       }
       const float mn0 = fmaxf(m0, bm0), mn1 = fmaxf(m1, bm1);
       const float al0 = expf(__fsub_rn(m0, mn0)), al1 = expf(__fsub_rn(m1, mn1));
@@ -404,18 +410,18 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
       make_p(m0, m1);
       __syncthreads();
     }
-    l0 = __fadd_rn(l0, __fadd_rn(__fadd_rn(__fadd_rn(red_l[g], red_l[kHeads + g]), red_l[2 * kHeads + g]),
-                                 red_l[3 * kHeads + g]));
-    l1 = __fadd_rn(l1, __fadd_rn(__fadd_rn(__fadd_rn(red_l[g + 8], red_l[kHeads + g + 8]), red_l[2 * kHeads + g + 8]),
-                                 red_l[3 * kHeads + g + 8]));
+    l0 = __fadd_rn(l0, __fadd_rn(__fadd_rn(__fadd_rn(red_l[g], red_l[kPass + g]), red_l[2 * kPass + g]),
+                                 red_l[3 * kPass + g]));
+    l1 = __fadd_rn(l1, __fadd_rn(__fadd_rn(__fadd_rn(red_l[g + 8], red_l[kPass + g + 8]), red_l[2 * kPass + g + 8]),
+                                 red_l[3 * kPass + g + 8]));
     if (b < 2)
       pv_block<true>(cod, scl, ps, w, o);
     else
       pv_block<false>(cod, scl, ps, w, o);
 
     if (b == a.nb - 1) {  // finish the row: sink, normalise, bf16, inverse RoPE
-      const float d0 = __fadd_rn(l0, expf(__fsub_rn(__ldg(a.sink + g), m0)));
-      const float d1 = __fadd_rn(l1, expf(__fsub_rn(__ldg(a.sink + g + 8), m1)));
+      const float d0 = __fadd_rn(l0, expf(__fsub_rn(__ldg(a.sink + a.hbase + g), m0)));
+      const float d1 = __fadd_rn(l1, expf(__fsub_rn(__ldg(a.sink + a.hbase + g + 8), m1)));
       const int dbase = 64 * w + 16 * t;
 #pragma unroll
       for (int hh = 0; hh < 2; ++hh) {
@@ -427,7 +433,7 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
           wv[4 + i] = finish_pair(__fdiv_rn(o[2 * i][2 * hh + 1], dd), __fdiv_rn(o[2 * i + 1][2 * hh + 1], dd),
                                   dbase + 8 + 2 * i, tb);
         }
-        uint4* dst = reinterpret_cast<uint4*>(a.out + ((size_t)r * kHeads + g + 8 * hh) * kHead + dbase);
+        uint4* dst = reinterpret_cast<uint4*>(a.out + ((size_t)r * kHeads + a.hbase + g + 8 * hh) * kHead + dbase);
         dst[0] = make_uint4(wv[0], wv[1], wv[2], wv[3]);
         dst[1] = make_uint4(wv[4], wv[5], wv[6], wv[7]);
       }
@@ -440,12 +446,11 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
 void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2* table, attn::Window win,
                    attn::Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, cudaStream_t s,
                    int win_lo) {
-  // The chunk kernel's head mapping is the decode one's: 16 query heads per rank (world 4). Refuse another
-  // world's heads rather than compute another world's attention.
-  if (attn::kHeads != 16)
-    die("prefill sparse_attn_p is built for 16 query heads per rank (world 4); this engine is built for world %d "
-        "(%d heads per rank)",
-        world::kWorld, attn::kHeads);
+  // The chunk kernel's head mapping is the decode one's: kPass (16) queries per launch. A rank with more
+  // heads runs it once per slice with a head offset, so every world computes a head with the same code.
+  if (attn::kHeads % kPass != 0)
+    die("prefill sparse_attn_p needs the rank's heads in multiples of %d; world %d gives %d heads per rank",
+        kPass, world::kWorld, attn::kHeads);
   static const int nsm = [] {
     int d, n;
     CUDA_CHECK(cudaGetDevice(&d));
@@ -469,7 +474,10 @@ void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2
   a.sink = sink;
   a.scale = (float)std::pow(512.0, -0.5);
   a.out = out;
-  attn_p_kernel<<<std::min(rows, nsm), kThreads, kSmem, s>>>(a);
+  for (int hb = 0; hb < attn::kHeads; hb += kPass) {  // one launch per 16 heads; world 4 is a single pass
+    a.hbase = hb;
+    attn_p_kernel<<<std::min(rows, nsm), kThreads, kSmem, s>>>(a);
+  }
   CUDA_CHECK(cudaGetLastError());
 }
 

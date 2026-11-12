@@ -23,8 +23,10 @@
 # Settings come from ./.env: PORT and ADDR (the API), MODEL (the name it answers
 # to), IS_LOCAL, NO_AUTH, RING_DIRECT, VISION. The rank list is FLEET, and it is the rank count: rank 0 is
 # the head and every other box the file names is one more rank. WORKERS only
-# writes that file when it does not exist. The engine loads world 4 only today
-# (engine/common/tp.h); the cutter takes the worlds the model allows, 1, 2 and 4.
+# writes that file when it does not exist. The image is built for world 4, and
+# $TP must equal that build's world (engine/common/tp.h); the cutter and the
+# kernels take any world the checkpoint divides, 1, 2 and 4 — 4 is the one whose
+# rank (127 GB) fits a GB10, since 2 needs 255 GB and 1 needs 507 GB per box.
 #
 # The artifacts live where the fleet puts rank 0's weight file (RANK0_WEIGHTS):
 # rank 0 reads them there, so nothing is copied on the head; its Engram shards and
@@ -371,15 +373,18 @@ done
 
 [[ "$TP" =~ ^[1-9][0-9]*$ ]] || die "TP='$TP' is not a positive integer (tensor-parallel degree)"
 
-# The kernels and the ring are TP=4 by construction (engine/common/tp.h). Cutting
-# another world on the way to serving would spend hours on files no build can
-# load, so serving refuses. Everything else touches files or the container, never
-# the kernels: `prepare --world N` cuts on purpose, `clear` deletes, `status`
-# reports, and all three work with any fleet.
+# The image is built for world 4 (one build per world, -DDSGB10_WORLD), and the
+# build's world is what $TP must equal at startup (engine/common/tp.h). Cutting
+# another world on the way to serving would spend hours on files this image
+# cannot load, so serving refuses. Everything else touches files or the
+# container, never the kernels: `prepare --world N` cuts on purpose, `clear`
+# deletes, `status` reports, and all three work with any fleet.
 if [ "$TP" != "4" ] && [ "$MODE" = "run" ]; then
-  die "the engine loads TP=4 only (engine/common/tp.h), so $TP rank(s) could never be served.
+  die "this image is built for world 4, so $TP rank(s) could not be served by it.
   The rank count follows the boxes you name: put three ssh targets in WORKERS, or let the
-  fleet file name ranks 1..3. For another split on purpose: ./start.sh prepare --world N"
+  fleet file name ranks 1..3. Worlds 1 and 2 divide the checkpoint and the kernels run them,
+  but a rank then holds 507 or 255 GB against a GB10's 128 GB, so 4 boxes is the split that fits.
+  For files of another world anyway: ./start.sh prepare --world N"
 fi
 
 # A clear only touches files: no fleet, no GPU, no checkpoint.
