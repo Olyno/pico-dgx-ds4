@@ -1,6 +1,6 @@
 // DSpark draft module (M7): the three DSpark blocks (mtp.0-2), main_proj, the shared embedding and vocab head,
-// the Markov head and the confidence head, on one rank at TP=4, as model.py's DSpark (README.md: how model.py
-// drives it, every launch, the collectives). Every launch is a PDL launch; counts, positions and tokens live on
+// the Markov head and the confidence head, on one rank of the built world (common/world.h), as model.py's
+// DSpark (README.md: how model.py drives it, every launch, the collectives). Every launch is a PDL launch; counts, positions and tokens live on
 // the device, so one CUDA graph of accept() + draft() serves every step.
 //
 // Per step, after the main model's verify: accept() the newly accepted positions (their main_hidden goes
@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include "attn/attn.h"
+#include "common/world.h"
 #include "kernels/dsk.h"
 
 namespace dsw {
@@ -35,10 +36,19 @@ inline constexpr int kBatchEnts = 3, kBatchRows = kDraft * kBatchEnts, kMaxEnts 
 // projections as prefill GEMMs and its MoE as moe_prefill, the weights read once for every entry (~1 ulp from the
 // 15-row kernels: the drafts may differ, never the verified tokens). kCandStride: a pass's candidates per draft step.
 inline constexpr int kWideEnts = 16, kWideRows = kDraft * kWideEnts, kCandStride = kWideEnts;
-inline constexpr int kRanks = 4;
-inline constexpr int kDim = 5120, kHc = 4, kQLora = 1280;
-inline constexpr int kVocab = 129280, kVocabRank = kVocab / kRanks, kMarkov = 256;
+inline constexpr int kRanks = world::kWorld;
+inline constexpr int kDim = world::kHidden, kHc = 4, kQLora = world::kQLora;
+inline constexpr int kVocab = world::kVocab, kVocabRank = kVocab / kRanks, kMarkov = 256;
+// The drafter's own attention: the main model's head dim and query heads, this rank's slice of each.
+inline constexpr int kHead = world::kLatent, kHeads = world::kHeads / kRanks;
+inline constexpr int kQaPart = kQLora / kRanks, kKvPart = kHead / kRanks;  // wq_a, wkv rows per rank
+inline constexpr int kQ = kHeads * kHead;                    // wq_b rows per rank
+inline constexpr int kOGroup = 1024, kOPart = kHeads / 8 * kOGroup;  // wo_a rows / wo_b columns per rank
+inline constexpr int kWoaK = 8 * kHead;                      // wo_a input per group
+inline constexpr int kInter = world::kExpertInter / kRanks;  // expert columns per rank
+inline constexpr int kMainProjPart = kDim / kRanks;          // main_proj's output rows per rank (1280 at world 4)
 inline constexpr int kExperts = 128, kTopK = 3, kNoiseToken = 128799;
+inline constexpr int kGatePart = kExperts / kRanks;  // router rows per rank
 inline constexpr int kMainK = 3 * kDim;  // main_hidden: the inputs of layers 37, 38, 39, concatenated
 // stack4: the confidence MLP's shape (Draft::enable_cf): 3 scalars a depth in, one hidden layer, a logit a depth out
 inline constexpr int kCfIn = 3 * kDraft, kCfHid = 64;
@@ -48,12 +58,12 @@ inline constexpr int kCfWords = 2 * kCfIn + kCfHid * kCfIn + kCfHid + kDraft * k
 struct BlockW {
   const uint8_t *wq_a, *wq_a_s, *wkv, *wkv_s, *wq_b, *wq_b_s, *wo_a, *wo_a_s, *wo_b, *wo_b_s;  // e4m3 L1, ue8m0
   const uint16_t *q_norm, *kv_norm, *attn_norm, *ffn_norm;
-  const float* sink;                               // [16]: this rank's heads
+  const float* sink;                               // [kHeads]: this rank's heads
   const float *attn_fn, *attn_base, *attn_scale;  // mHC; fn [24][5120]: this rank's copy of the stream
   const float *ffn_fn, *ffn_base, *ffn_scale;
-  const uint8_t* gate;     // bf16 [32][5120] L2: this rank's 32 experts' router rows
-  const float* gate_bias;  // [128]
-  dsk::MoeWeights moe;     // the 128 experts' and the shared expert's 576-row slices
+  const uint8_t* gate;     // bf16 [kGatePart][5120] L2: this rank's experts' router rows (32 at world 4)
+  const float* gate_bias;  // [kExperts] (128)
+  dsk::MoeWeights moe;     // the 128 experts' and the shared expert's kInter-row slices
   // Optional, whole on every rank (the runner gathers them once): the mHC projections over all 4 copies of
   // the stream, [24][20480], and all 128 router rows, bf16 [128][5120] L2. Given, the pass computes every
   // rank's projection chunks and router logits itself, bit for bit what the gathers would bring, without

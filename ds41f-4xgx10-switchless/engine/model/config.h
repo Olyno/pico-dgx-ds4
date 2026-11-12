@@ -1,22 +1,24 @@
-// DeepSeek-V4.1-Flash at TP=4 on the GB10 ring: the shapes and the per-layer roles the runner needs.
-// Everything here is fixed by the checkpoint (config.json) and DESIGN.md decision 1.
+// DeepSeek-V4.1-Flash on the GB10 ring: the shapes and the per-layer roles the runner needs.
+// Everything here is fixed by the checkpoint (config.json) and DESIGN.md decision 1, except the world,
+// which is the build's (common/world.h: DSGB10_WORLD, default 4). Every per-rank shape below derives
+// from kRanks, and the kernels, the ring and the server take their per-rank geometry from these.
 #pragma once
 #include <cstdint>
 
+#include "common/world.h"
+
 namespace model {
 
-// The tensor-parallel degree. Every per-rank shape below derives from it, so this is the one
-// constant a TP generalisation starts from; the kernels' launch shapes and the ring's relay
-// topology (opposite rank (r+2)%kRanks, quarter reduce-scatter) assume 4 today, which is why
-// $TP != 4 is refused at startup (engine/common/tp.h).
-constexpr int kRanks = 4;
+// The tensor-parallel degree this binary is built for (one build per world; $TP must agree at startup,
+// engine/common/tp.h). The ring's relay topology and the reduce-scatter's part count are comm::kRanks.
+constexpr int kRanks = world::kWorld;
 constexpr int kLayers = 40;
-constexpr int kDim = 5120;
+constexpr int kDim = world::kHidden;
 constexpr int kHc = 4;                      // residual copies (mHC)
 constexpr int kHcDim = kHc * kDim;          // 20480
 constexpr int kMix = 24;                    // (2 + hc) * hc mixes per sublayer
-constexpr int kVocab = 129280;
-constexpr int kVocabPart = kVocab / kRanks;  // 32320 head rows per rank
+constexpr int kVocab = world::kVocab;
+constexpr int kVocabPart = kVocab / kRanks;  // 32320 head rows per rank at world 4
 // Rows per step, at most (docs/batching.md, B4): one session's decode (1), verify (<= 6) or prefill-by-steps
 // rows (<= kMaxSessRows), or several sessions' runs of consecutive rows (Model::launch_batch) up to 16. The
 // step buffers, the StepIn / SampleOut rings, the sampler's grid and the graphs are sized by it; a graph is
@@ -43,24 +45,26 @@ constexpr int kMaxUnits = 64;
 constexpr int kUnitMul = 8;
 
 // attention, per rank
-constexpr int kQLora = 1280, kQaPart = kQLora / kRanks;  // wq_a: 320 rows per rank
-constexpr int kHead = 512, kKvPart = kHead / kRanks;     // wkv: 128 rows per rank
-constexpr int kCompPart = kHead / kRanks;                // compressor wkv / wgate: 128 rows per rank
-constexpr int kHeads = 16;                               // query heads per rank
-constexpr int kQ = kHeads * kHead;                       // wq_b: 8192 rows per rank
-constexpr int kOGroupRows = 1024;                        // wo_a rows per group (2 groups per rank)
-constexpr int kOPart = 2 * kOGroupRows;                  // 2048 = wo_a rows = wo_b columns per rank
-constexpr int kWoaK = 4096;                              // wo_a input per group (8 heads x 512)
+constexpr int kQLora = world::kQLora, kQaPart = kQLora / kRanks;  // wq_a: 320 rows per rank at world 4
+constexpr int kHead = world::kLatent, kKvPart = kHead / kRanks;   // wkv: 128 rows per rank at world 4
+constexpr int kCompPart = kHead / kRanks;                // compressor wkv / wgate: 128 rows at world 4
+constexpr int kHeadsAll = world::kHeads;                 // query heads, the checkpoint's 64
+constexpr int kHeads = kHeadsAll / kRanks;               // query heads per rank (16 at world 4)
+constexpr int kQ = kHeads * kHead;                       // wq_b: 8192 rows per rank at world 4
+constexpr int kOGroupHeads = 8;                          // wo_a's groups are 8 heads wide
+constexpr int kOGroupRows = 1024;                        // wo_a rows per group
+constexpr int kOPart = kHeads / kOGroupHeads * kOGroupRows;  // 2048 = wo_a rows = wo_b columns per rank
+constexpr int kWoaK = kOGroupHeads * kHead;              // wo_a input per group (8 heads x 512)
 constexpr int kIdxHeads = 32, kIdxDim = 128;             // indexer (replicated)
 constexpr int kIdxQ = kIdxHeads * kIdxDim;               // 4096
 constexpr int kIdxTopk = 512;
 constexpr int kPoolBlocks = 2048;                        // layer 20's candidate pool (blocks of 8)
 
 // MoE
-constexpr int kExperts = 384, kGatePart = kExperts / kRanks;  // gate: 96 rows per rank
+constexpr int kExperts = world::kExperts, kGatePart = kExperts / kRanks;  // gate: 96 rows per rank at world 4
 constexpr int kTopK = 6;
 constexpr float kRouteScale = 1.5f;
-constexpr int kInterPart = 576;  // expert and shared-expert intermediate columns per rank (2304 / 4)
+constexpr int kInterPart = world::kExpertInter / kRanks;  // expert and shared-expert intermediate columns per rank
 
 constexpr float kNormEps = 1e-20f;
 

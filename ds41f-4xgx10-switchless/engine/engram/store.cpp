@@ -34,6 +34,21 @@ constexpr uint64_t kKeepAlive = kDiscard | 1;       //   keeping the SSD awake
 constexpr uint64_t kPad = kDiscard | 2;             //   rounding a batch up to read_batch
 
 inline uint64_t key_of(int layer, uint32_t row) { return (uint64_t(layer) << 32) | row; }
+
+// A kit shard's name says which world it was cut for: engram-l{layer}-r{rank}of{world}.bin, as
+// engine/engram/tools/pack.cpp writes it (dsw-prepare --world N runs that). A directory cut for another
+// world holds other row ranges and other ranks, so it is refused with the world it is for; a file with
+// another name (a test's) is left to the header's checks.
+void check_shard_name(const std::string& path, int64_t layer, int rank) {
+  const std::string base = path.substr(path.find_last_of('/') + 1);
+  const std::string head = "engram-l" + std::to_string(layer) + "-r" + std::to_string(rank) + "of";
+  if (base.compare(0, head.size(), head) != 0) return;
+  const std::string rest = base.substr(head.size()), world = rest.substr(0, rest.find('.'));
+  if (world != std::to_string(kWorld))
+    die("engram: %s is cut for a world of %s ranks, but this engine is built for world %d (re-cut the shards "
+        "for this world, or rebuild with -DDSGB10_WORLD=%s)",
+        path.c_str(), world.c_str(), kWorld, world.c_str());
+}
 inline uint64_t now_ns() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
       .count();
@@ -178,6 +193,7 @@ struct Store::Impl {
     if (cfg.source == Source::KitShard) {
       if (cfg.rank < 0) die("engram: the kit shards hold one rank each; single-box mode reads the checkpoint");
       for (int l = 0; l < kLayers; l++) {
+        check_shard_name(cfg.shard[l], m.layer_ids[l], cfg.rank);
         const int fd = open(cfg.shard[l].c_str(), O_RDONLY | O_DIRECT);
         if (fd < 0) die("engram: open %s: %s", cfg.shard[l].c_str(), strerror(errno));
         uint64_t h[6];

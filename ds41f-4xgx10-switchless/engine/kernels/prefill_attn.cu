@@ -440,6 +440,12 @@ __global__ void __launch_bounds__(kThreads, 1) attn_p_kernel(PArgs a) {
 void sparse_attn_p(const uint16_t* q_pre, const int* pos, int rows, const float2* table, attn::Window win,
                    attn::Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, cudaStream_t s,
                    int win_lo) {
+  // The chunk kernel's head mapping is the decode one's: 16 query heads per rank (world 4). Refuse another
+  // world's heads rather than compute another world's attention.
+  if (attn::kHeads != 16)
+    die("prefill sparse_attn_p is built for 16 query heads per rank (world 4); this engine is built for world %d "
+        "(%d heads per rank)",
+        world::kWorld, attn::kHeads);
   static const int nsm = [] {
     int d, n;
     CUDA_CHECK(cudaGetDevice(&d));

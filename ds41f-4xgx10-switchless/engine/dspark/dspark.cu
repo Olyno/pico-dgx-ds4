@@ -614,28 +614,36 @@ Weights weights_from(std::initializer_list<const dsw::WeightFile*> files) {
     const std::string p = "mtp." + std::to_string(i) + ".";
     const std::string a = p + "attn.", e = p + "ffn.experts.", sh = p + "ffn.shared_experts.";
     BlockW& b = w.b[i];
-    b.wq_a = f.u8(a + "wq_a.weight", 320ull * kDim), b.wq_a_s = f.u8(a + "wq_a.scale", 10 * 160);
-    b.wkv = f.u8(a + "wkv.weight", 128ull * kDim), b.wkv_s = f.u8(a + "wkv.scale", 4 * 160);
-    b.wq_b = f.u8(a + "wq_b.weight", 8192ull * kQLora), b.wq_b_s = f.u8(a + "wq_b.scale", 256 * 40);
-    b.wo_a = f.u8(a + "wo_a.weight", 2048ull * 4096), b.wo_a_s = f.u8(a + "wo_a.scale", 64 * 128);
-    b.wo_b = f.u8(a + "wo_b.weight", 5120ull * 2048), b.wo_b_s = f.u8(a + "wo_b.scale", 160 * 64);
-    b.q_norm = f.u16(a + "q_norm.weight", kQLora), b.kv_norm = f.u16(a + "kv_norm.weight", 512);
+    b.wq_a = f.u8(a + "wq_a.weight", (uint64_t)kQaPart * kDim);
+    b.wq_a_s = f.u8(a + "wq_a.scale", (uint64_t)kQaPart / 32 * (kDim / 32));
+    b.wkv = f.u8(a + "wkv.weight", (uint64_t)kKvPart * kDim);
+    b.wkv_s = f.u8(a + "wkv.scale", (uint64_t)kKvPart / 32 * (kDim / 32));
+    b.wq_b = f.u8(a + "wq_b.weight", (uint64_t)kQ * kQLora);
+    b.wq_b_s = f.u8(a + "wq_b.scale", (uint64_t)kQ / 32 * (kQLora / 32));
+    b.wo_a = f.u8(a + "wo_a.weight", (uint64_t)kOPart * kWoaK);
+    b.wo_a_s = f.u8(a + "wo_a.scale", (uint64_t)kOPart / 32 * (kWoaK / 32));
+    b.wo_b = f.u8(a + "wo_b.weight", (uint64_t)kDim * kOPart);
+    b.wo_b_s = f.u8(a + "wo_b.scale", (uint64_t)kDim / 32 * (kOPart / 32));
+    b.q_norm = f.u16(a + "q_norm.weight", kQLora), b.kv_norm = f.u16(a + "kv_norm.weight", kHead);
     b.attn_norm = f.u16(p + "attn_norm.weight", kDim), b.ffn_norm = f.u16(p + "ffn_norm.weight", kDim);
-    b.sink = f.f32(a + "attn_sink", 16);
+    b.sink = f.f32(a + "attn_sink", kHeads);
     b.attn_fn = f.f32(p + "hc_attn_fn", 24 * kDim), b.attn_base = f.f32(p + "hc_attn_base", 24);
     b.attn_scale = f.f32(p + "hc_attn_scale", 3);
     b.ffn_fn = f.f32(p + "hc_ffn_fn", 24 * kDim), b.ffn_base = f.f32(p + "hc_ffn_base", 24);
     b.ffn_scale = f.f32(p + "hc_ffn_scale", 3);
-    b.gate = f.u8(p + "ffn.gate.weight", 32ull * kDim * 2), b.gate_bias = f.f32(p + "ffn.gate.bias", kExperts);
-    const uint64_t up = 128ull * 576 * 2560, up_s = 128ull * 576 * 160, dn = 128ull * 5120 * 288,
-                   dn_s = 128ull * 5120 * 18;
+    b.gate = f.u8(p + "ffn.gate.weight", (uint64_t)kGatePart * kDim * 2);
+    b.gate_bias = f.f32(p + "ffn.gate.bias", kExperts);
+    // all kExperts experts' slices of this rank: [kInter][kDim] each way, e4m3 / 2 and ue8m0 / 32
+    const uint64_t up = (uint64_t)kExperts * kInter * (kDim / 2), up_s = (uint64_t)kExperts * kInter * (kDim / 32),
+                   dn = (uint64_t)kExperts * kDim * (kInter / 2), dn_s = (uint64_t)kExperts * kDim * (kInter / 32);
     b.moe = {f.u8(e + "w1.weight", up),           f.u8(e + "w1.scale", up_s),         f.u8(e + "w3.weight", up),
              f.u8(e + "w3.scale", up_s),          f.u8(e + "w2.weight", dn),          f.u8(e + "w2.scale", dn_s),
-             f.u8(sh + "w1.weight", 576ull * kDim), f.u8(sh + "w1.scale", 18 * 160), f.u8(sh + "w3.weight", 576ull * kDim),
-             f.u8(sh + "w3.scale", 18 * 160),     f.u8(sh + "w2.weight", 576ull * kDim), f.u8(sh + "w2.scale", 160 * 18)};
+             f.u8(sh + "w1.weight", (uint64_t)kInter * kDim), f.u8(sh + "w1.scale", (uint64_t)kInter / 32 * (kDim / 32)),
+             f.u8(sh + "w3.weight", (uint64_t)kInter * kDim), f.u8(sh + "w3.scale", (uint64_t)kInter / 32 * (kDim / 32)),
+             f.u8(sh + "w2.weight", (uint64_t)kDim * kInter), f.u8(sh + "w2.scale", (uint64_t)kDim / 32 * (kInter / 32))};
   }
-  w.main_proj = f.u8("mtp.0.main_proj.weight", 1280ull * kMainK);
-  w.main_proj_s = f.u8("mtp.0.main_proj.scale", 40 * 480);
+  w.main_proj = f.u8("mtp.0.main_proj.weight", (uint64_t)kMainProjPart * kMainK);
+  w.main_proj_s = f.u8("mtp.0.main_proj.scale", (uint64_t)kMainProjPart / 32 * (kMainK / 32));
   w.main_norm = f.u16("mtp.0.main_norm.weight", kDim);
   w.norm = f.u16("mtp.2.norm.weight", kDim);
   w.embed = f.u16("embed.weight", (uint64_t)kVocab * kDim);
@@ -914,19 +922,20 @@ Draft::Draft(const Weights& w, int rank, Comm* comm, const float2* table, int sl
   for (int pass = 0; pass < 2; ++pass) {
     off = 0;
     take(b.hq, A * kMainK), take(b.hs, A * kMainK / 32), take(b.start, 4);
-    take(b.mp_r, A * 1280 * 2), take(b.mp, A * kDim * 2), take(b.main_x, A * kDim * 2);
-    take(b.mkv_r, kBlocks * A * 128 * 2), take(b.mkv, kBlocks * A * 512 * 2);
+    take(b.mp_r, A * kMainProjPart * 2), take(b.mp, A * kDim * 2), take(b.main_x, A * kDim * 2);
+    take(b.mkv_r, kBlocks * A * kKvPart * 2), take(b.mkv, kBlocks * A * kHead * 2);
     for (attn::Window& r : b.ring) take(r.kv, slots_ * attn::kRing * 512), take(r.sc, slots_ * attn::kRing * 16);
     take(b.pos, R * 4), take(b.lo, R * 4), take(b.hi, R * 4);
     take(b.xa, kStreamBytes), take(b.xb, kStreamBytes);
     take(b.chunks_r, kChunkBytes), take(b.chunks, kChunkBytes * kRanks);
     take(b.pre, R * 4 * 4), take(b.post, R * 4 * 4), take(b.comb, R * 16 * 4);
     take(b.y, R * kDim * 2), take(b.xq, R * kDim), take(b.xs, R * kDim / 32);
-    take(b.qa_r, R * 320 * 2), take(b.kvp_r, R * 128 * 2), take(b.qa, R * kQLora * 2), take(b.kvp, R * 512 * 2);
-    take(b.qq, R * kQLora), take(b.qs, R * kQLora / 32), take(b.qb, R * 8192 * 2);
-    take(b.so, R * kSplits * 16 * 512 * 4), take(b.sml, R * kSplits * 16 * 2 * 4), take(b.o, R * 8192 * 2);
-    take(b.oq, R * 2048), take(b.os, R * 2048 / 32), take(b.part, R * kDim * 2), take(b.sub, R * kDim * 2);
-    take(b.lg_r, R * 32 * 4), take(b.lg, R * kExperts * 4), take(b.idx, R * kTopKPad * 4), take(b.wts, R * kTopKPad * 4);
+    take(b.qa_r, R * kQaPart * 2), take(b.kvp_r, R * kKvPart * 2), take(b.qa, R * kQLora * 2), take(b.kvp, R * kHead * 2);
+    take(b.qq, R * kQLora), take(b.qs, R * kQLora / 32), take(b.qb, R * kQ * 2);
+    take(b.so, R * kSplits * kHeads * kHead * 4), take(b.sml, R * kSplits * kHeads * 2 * 4), take(b.o, R * kQ * 2);
+    take(b.oq, R * kOPart), take(b.os, R * kOPart / 32), take(b.part, R * kDim * 2), take(b.sub, R * kDim * 2);
+    take(b.lg_r, R * kGatePart * 4), take(b.lg, R * kExperts * 4), take(b.idx, R * kTopKPad * 4),
+        take(b.wts, R * kTopKPad * 4);
     take(b.ymoe, R * kDim * 4), take(b.moe_ws, dsk::moe_workspace_bytes());
     take(b.hx, R * kDim * 2), take(b.hxn, R * kDim * 2), take(b.logits, R * kVocabRank * 4), take(b.dl, R * kVocabRank * 4);
     take(b.emb, R * kMarkov * 2), take(b.cta, kMarkovCtas * sizeof(Cand)), take(b.cand, 8 * sizeof(Cand));
@@ -995,17 +1004,17 @@ void Draft::accept(const uint16_t* mh, const int* count, const int* pos0, cudaSt
   tap(taps.main_hidden, mh, (size_t)kMaxAcc * kMainK * 2, s);
   launch(accept_prep_kernel, dim3(kMainK / 256, kMaxAcc), dim3(256), 0, s, true, mh, count, pos0, row0, b.hq, b.hs,
          start_out ? start_out : b.start);
-  dsk::gemv_fp8(b.hq, b.hs, kMaxAcc, w_.main_proj, w_.main_proj_s, kDim / kRanks, kMainK, bf(b.mp_r), c8, s);
-  const GatherSeg g{b.mp_r, 1280 * 2, b.mp, kDim * 2, 1280 * 2, kMaxAcc};
+  dsk::gemv_fp8(b.hq, b.hs, kMaxAcc, w_.main_proj, w_.main_proj_s, kMainProjPart, kMainK, bf(b.mp_r), c8, s);
+  const GatherSeg g{b.mp_r, kMainProjPart * 2, b.mp, kDim * 2, kMainProjPart * 2, kMaxAcc};
   comm_->all_gather(&g, 1, s);  // COLLECTIVE: all-gather of main_proj's outputs
   dsk::Fp8Seg seg[kBlocks];
   GatherSeg gk[kBlocks];
   attn::KvSets sets;
   sets.n = kBlocks;
   for (int i = 0; i < kBlocks; ++i) {
-    uint16_t *part = b.mkv_r + (size_t)i * kMaxAcc * 128, *full = b.mkv + (size_t)i * kMaxAcc * 512;
-    seg[i] = {w_.b[i].wkv, w_.b[i].wkv_s, bf(part), 128};
-    gk[i] = {part, 128 * 2, full, 512 * 2, 128 * 2, kMaxAcc};
+    uint16_t *part = b.mkv_r + (size_t)i * kMaxAcc * kKvPart, *full = b.mkv + (size_t)i * kMaxAcc * kHead;
+    seg[i] = {w_.b[i].wkv, w_.b[i].wkv_s, bf(part), kKvPart};
+    gk[i] = {part, kKvPart * 2, full, kHead * 2, kKvPart * 2, kMaxAcc};
     sets.s[i] = {full, w_.b[i].kv_norm, win(i, slot)};
   }
   dsk::gemv_fp8_norm(bf(b.mp), bf(w_.main_norm), kEps, kMaxAcc, seg, kBlocks, kDim, c8k, s, bf(b.main_x));
@@ -1049,23 +1058,24 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
     mix(b.xa, w.attn_fn, w.attn_fn_all, w.attn_scale, w.attn_base, w.attn_norm, s);
     tap_mix(taps.mix[i][0], b.pre, b.post, b.comb, s);
     tap(taps.attn_in[i], b.y, rows_bytes, s);
-    const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.qa_r), 320}, {w.wkv, w.wkv_s, bf(b.kvp_r), 128}};
+    const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.qa_r), kQaPart},
+                                {w.wkv, w.wkv_s, bf(b.kvp_r), kKvPart}};
     dsk::gemv_fp8_multi(b.xq, b.xs, kDraft, seg, 2, kDim, c8k, s);
-    const GatherSeg g[2] = {{b.qa_r, 320 * 2, b.qa, kQLora * 2, 320 * 2, kDraft},
-                            {b.kvp_r, 128 * 2, b.kvp, 512 * 2, 128 * 2, kDraft}};
+    const GatherSeg g[2] = {{b.qa_r, kQaPart * 2, b.qa, kQLora * 2, kQaPart * 2, kDraft},
+                            {b.kvp_r, kKvPart * 2, b.kvp, kHead * 2, kKvPart * 2, kDraft}};
     comm_->all_gather(g, 2, s);  // COLLECTIVE: all-gather of wq_a's and wkv's outputs
     tap(taps.qa[i], b.qa, (size_t)kDraft * kQLora * 2, s);
     attn::DecodePrep a;
     a.pos = b.pos, a.table = table_, a.qa = b.qa, a.q_norm = w.q_norm, a.qq = b.qq, a.qs = b.qs;
     a.kv_pre = b.kvp, a.kv_norm = w.kv_norm, a.win = win(i, slot);
     attn::decode_prep(a, kDraft, true, s);
-    dsk::gemv_fp8(b.qq, b.qs, kDraft, w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.qb), cqb, s);
-    tap(taps.q_pre[i], b.qb, (size_t)kDraft * 8192 * 2, s);
+    dsk::gemv_fp8(b.qq, b.qs, kDraft, w.wq_b, w.wq_b_s, kQ, kQLora, bf(b.qb), cqb, s);
+    tap(taps.q_pre[i], b.qb, (size_t)kDraft * kQ * 2, s);
     attn::sparse_attn(b.qb, b.pos, {b.lo, b.hi}, kDraft, table_, win(i, slot), attn::Compressed{}, nullptr, 0, w.sink,
                       b.o, kSplits, {b.so, b.sml, kSplits}, s, true);
-    tap(taps.attn_o[i], b.o, (size_t)kDraft * 8192 * 2, s);
-    dsk::gemv_woa(bf(b.o), kDraft, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s, b.oq, b.os);
-    dsk::gemv_fp8(b.oq, b.os, kDraft, w.wo_b, w.wo_b_s, kDim, 2048, bf(b.part), cob, s);
+    tap(taps.attn_o[i], b.o, (size_t)kDraft * kQ * 2, s);
+    dsk::gemv_woa(bf(b.o), kDraft, w.wo_a, w.wo_a_s, kOPart, kWoaK, kOGroup, nullptr, cw, false, s, b.oq, b.os);
+    dsk::gemv_fp8(b.oq, b.os, kDraft, w.wo_b, w.wo_b_s, kDim, kOPart, bf(b.part), cob, s);
     comm_->all_reduce(b.part, false, b.sub, (size_t)kDraft * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial
     tap(taps.attn_out[i], b.sub, rows_bytes, s);
     attn::hc_post(b.sub, b.xa, b.post, b.comb, kDraft, b.xb, s, true);
@@ -1079,8 +1089,8 @@ void Draft::draft(const int* token, cudaStream_t s, const int* slot) {
     if (w.gate_all) {
       dsk::gemv_bf16(bf(b.y), kDraft, w.gate_all, kExperts, kDim, b.lg, nullptr, cg, false, s);
     } else {
-      dsk::gemv_bf16(bf(b.y), kDraft, w.gate, 32, kDim, b.lg_r, nullptr, cg, false, s);
-      const GatherSeg gl{b.lg_r, 32 * 4, b.lg, kExperts * 4, 32 * 4, kDraft};
+      dsk::gemv_bf16(bf(b.y), kDraft, w.gate, kGatePart, kDim, b.lg_r, nullptr, cg, false, s);
+      const GatherSeg gl{b.lg_r, kGatePart * 4, b.lg, kExperts * 4, kGatePart * 4, kDraft};
       comm_->all_gather(&gl, 1, s);  // COLLECTIVE: all-gather of the router logits
     }
     launch(router3_kernel<false>, dim3(1), dim3(32 * kDraft), 0, s, true, (const float*)b.lg, w.gate_bias, b.idx,
@@ -1165,11 +1175,13 @@ void Draft::enable_batch() {
     take(b.bchunks_r, 10 * R * 25 * 4), take(b.bchunks, kHcChunks * R * 25 * 4);
     take(b.bpre, R * 4 * 4), take(b.bpost, R * 4 * 4), take(b.bcomb, R * 16 * 4);
     take(b.by, R * kDim * 2), take(b.bxq, R * kDim), take(b.bxs, R * kDim / 32);
-    take(b.bqa_r, R * 320 * 2), take(b.bkvp_r, R * 128 * 2), take(b.bqa, R * kQLora * 2), take(b.bkvp, R * 512 * 2);
-    take(b.bqq, R * kQLora), take(b.bqs, R * kQLora / 32), take(b.bqb, R * 8192 * 2);
-    take(b.bso, R * kSplits * 16 * 512 * 4), take(b.bsml, R * kSplits * 16 * 2 * 4), take(b.bo, R * 8192 * 2);
-    take(b.boq, R * 2048), take(b.bos, R * 2048 / 32), take(b.bpart, R * kDim * 2), take(b.bsub, R * kDim * 2);
-    take(b.blg_r, R * 32 * 4), take(b.blg, R * kExperts * 4), take(b.bidx, R * kTopKPad * 4), take(b.bwts, R * kTopKPad * 4);
+    take(b.bqa_r, R * kQaPart * 2), take(b.bkvp_r, R * kKvPart * 2), take(b.bqa, R * kQLora * 2),
+        take(b.bkvp, R * kHead * 2);
+    take(b.bqq, R * kQLora), take(b.bqs, R * kQLora / 32), take(b.bqb, R * kQ * 2);
+    take(b.bso, R * kSplits * kHeads * kHead * 4), take(b.bsml, R * kSplits * kHeads * 2 * 4), take(b.bo, R * kQ * 2);
+    take(b.boq, R * kOPart), take(b.bos, R * kOPart / 32), take(b.bpart, R * kDim * 2), take(b.bsub, R * kDim * 2);
+    take(b.blg_r, R * kGatePart * 4), take(b.blg, R * kExperts * 4), take(b.bidx, R * kTopKPad * 4),
+        take(b.bwts, R * kTopKPad * 4);
     take(b.bymoe, R * kDim * 4), take(b.bmoe_ws, dsk::moe_workspace_bytes());
     take(b.bhx, R * kDim * 2), take(b.bhxn, R * kDim * 2), take(b.blogits, R * kVocabRank * 4), take(b.bdl, R * kVocabRank * 4);
     take(b.bemb, R * kMarkov * 2), take(b.bcta, E * kMarkovCtas * sizeof(Cand)), take(b.bcand, C * sizeof(Cand));
@@ -1229,20 +1241,21 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
     const BlockW& w = w_.b[i];
     // ---- attention sublayer: each row's SWA over its own window's last 128 main positions and its block
     bmix(b.bxa, R, w.attn_fn, w.attn_fn_all, w.attn_scale, w.attn_base, w.attn_norm, s);
-    const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.bqa_r), 320}, {w.wkv, w.wkv_s, bf(b.bkvp_r), 128}};
+    const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.bqa_r), kQaPart},
+                                {w.wkv, w.wkv_s, bf(b.bkvp_r), kKvPart}};
     dsk::gemv_fp8_multi(b.bxq, b.bxs, R, seg, 2, kDim, c8k, s);
-    const GatherSeg g[2] = {{b.bqa_r, 320 * 2, b.bqa, kQLora * 2, 320 * 2, R},
-                            {b.bkvp_r, 128 * 2, b.bkvp, 512 * 2, 128 * 2, R}};
+    const GatherSeg g[2] = {{b.bqa_r, kQaPart * 2, b.bqa, kQLora * 2, kQaPart * 2, R},
+                            {b.bkvp_r, kKvPart * 2, b.bkvp, kHead * 2, kKvPart * 2, R}};
     comm_->all_gather(g, 2, s);  // COLLECTIVE: all-gather of wq_a's and wkv's outputs
     attn::DecodePrep a;
     a.pos = b.bpos, a.table = table_, a.qa = b.bqa, a.q_norm = w.q_norm, a.qq = b.bqq, a.qs = b.bqs;
     a.kv_pre = b.bkvp, a.kv_norm = w.kv_norm, a.win = win(i, p.slot);
     attn::decode_prep(a, R, true, s);
-    dsk::gemv_fp8(b.bqq, b.bqs, R, w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.bqb), cqb, s);
+    dsk::gemv_fp8(b.bqq, b.bqs, R, w.wq_b, w.wq_b_s, kQ, kQLora, bf(b.bqb), cqb, s);
     attn::sparse_attn(b.bqb, b.bpos, {b.blo, b.bhi}, R, table_, win(i, p.slot), attn::Compressed{}, nullptr, 0, w.sink,
                       b.bo, kSplits, {b.bso, b.bsml, kSplits}, s, true);
-    dsk::gemv_woa(bf(b.bo), R, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s, b.boq, b.bos);
-    dsk::gemv_fp8(b.boq, b.bos, R, w.wo_b, w.wo_b_s, kDim, 2048, bf(b.bpart), cob, s);
+    dsk::gemv_woa(bf(b.bo), R, w.wo_a, w.wo_a_s, kOPart, kWoaK, kOGroup, nullptr, cw, false, s, b.boq, b.bos);
+    dsk::gemv_fp8(b.boq, b.bos, R, w.wo_b, w.wo_b_s, kDim, kOPart, bf(b.bpart), cob, s);
     comm_->all_reduce(b.bpart, false, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial
     attn::hc_post(b.bsub, b.bxa, b.bpost, b.bcomb, R, b.bxb, s, true);
     // ---- FFN sublayer: 128 experts, top-3 per row, and the shared expert
@@ -1250,8 +1263,8 @@ void Draft::draft_batch(const BatchPass& p, cudaStream_t s) {
     if (w.gate_all) {
       dsk::gemv_bf16(bf(b.by), R, w.gate_all, kExperts, kDim, b.blg, nullptr, cg, false, s);
     } else {
-      dsk::gemv_bf16(bf(b.by), R, w.gate, 32, kDim, b.blg_r, nullptr, cg, false, s);
-      const GatherSeg gl{b.blg_r, 32 * 4, b.blg, kExperts * 4, 32 * 4, R};
+      dsk::gemv_bf16(bf(b.by), R, w.gate, kGatePart, kDim, b.blg_r, nullptr, cg, false, s);
+      const GatherSeg gl{b.blg_r, kGatePart * 4, b.blg, kExperts * 4, kGatePart * 4, R};
       comm_->all_gather(&gl, 1, s);  // COLLECTIVE: all-gather of the router logits
     }
     launch(router3_kernel<true>, dim3(p.n), dim3(32 * kDraft), 0, s, true, (const float*)b.blg, w.gate_bias, b.bidx,
@@ -1319,42 +1332,42 @@ void Draft::draft_batch_wide(const BatchPass& p, cudaStream_t s) {
     bmix(b.bxa, R, w.attn_fn, w.attn_fn_all, w.attn_scale, w.attn_base, w.attn_norm, s);
     for (int r0 = 0; r0 < R; r0 += kBatchRows) {  // small matrices: the narrow pass's GEMV calls (its bits)
       const int m = std::min(kBatchRows, R - r0);
-      const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.bqa_r) + (size_t)r0 * 320, 320},
-                                  {w.wkv, w.wkv_s, bf(b.bkvp_r) + (size_t)r0 * 128, 128}};
+      const dsk::Fp8Seg seg[2] = {{w.wq_a, w.wq_a_s, bf(b.bqa_r) + (size_t)r0 * kQaPart, kQaPart},
+                                  {w.wkv, w.wkv_s, bf(b.bkvp_r) + (size_t)r0 * kKvPart, kKvPart}};
       dsk::gemv_fp8_multi(b.bxq + (size_t)r0 * kDim, b.bxs + (size_t)r0 * (kDim / 32), m, seg, 2, kDim, c8k, s);
     }
-    const GatherSeg g[2] = {{b.bqa_r, 320 * 2, b.bqa, kQLora * 2, 320 * 2, R},
-                            {b.bkvp_r, 128 * 2, b.bkvp, 512 * 2, 128 * 2, R}};
+    const GatherSeg g[2] = {{b.bqa_r, kQaPart * 2, b.bqa, kQLora * 2, kQaPart * 2, R},
+                            {b.bkvp_r, kKvPart * 2, b.bkvp, kHead * 2, kKvPart * 2, R}};
     comm_->all_gather(g, 2, s);  // COLLECTIVE: all-gather of wq_a's and wkv's outputs
     for (int r0 = 0; r0 < R; r0 += kBatchRows) {
       const int m = std::min(kBatchRows, R - r0);
       attn::DecodePrep a;
       a.pos = b.bpos + r0, a.table = table_, a.qa = b.bqa + (size_t)r0 * kQLora, a.q_norm = w.q_norm;
       a.qq = b.bqq + (size_t)r0 * kQLora, a.qs = b.bqs + (size_t)r0 * (kQLora / 32);
-      a.kv_pre = b.bkvp + (size_t)r0 * 512, a.kv_norm = w.kv_norm, a.win = win(i, p.slot + r0);
+      a.kv_pre = b.bkvp + (size_t)r0 * kHead, a.kv_norm = w.kv_norm, a.win = win(i, p.slot + r0);
       attn::decode_prep(a, m, true, s);
     }
     if (gemm) {
-      const dsk::Fp8Seg qb{w.wq_b, w.wq_b_s, bf(b.bqb), 8192};
+      const dsk::Fp8Seg qb{w.wq_b, w.wq_b_s, bf(b.bqb), kQ};
       dsk::gemm_fp8_p(b.bqq, b.bqs, R, &qb, 1, kQLora, s);
     } else {
       for (int r0 = 0; r0 < R; r0 += kBatchRows)
         dsk::gemv_fp8(b.bqq + (size_t)r0 * kQLora, b.bqs + (size_t)r0 * (kQLora / 32), std::min(kBatchRows, R - r0),
-                      w.wq_b, w.wq_b_s, 8192, kQLora, bf(b.bqb) + (size_t)r0 * 8192, cqb, s);
+                      w.wq_b, w.wq_b_s, kQ, kQLora, bf(b.bqb) + (size_t)r0 * kQ, cqb, s);
     }
     attn::sparse_attn(b.bqb, b.bpos, {b.blo, b.bhi}, R, table_, win(i, p.slot), attn::Compressed{}, nullptr, 0, w.sink,
                       b.bo, kSplits, {b.bso, b.bsml, kSplits}, s, true);
     if (gemm) {
-      dsk::gemm_woa_p(bf(b.bo), R, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, b.boq, b.bos, s);
+      dsk::gemm_woa_p(bf(b.bo), R, w.wo_a, w.wo_a_s, kOPart, kWoaK, kOGroup, nullptr, b.boq, b.bos, s);
       const dsk::Fp8Seg ob{w.wo_b, w.wo_b_s, bf(b.bpart), kDim};
-      dsk::gemm_fp8_p(b.boq, b.bos, R, &ob, 1, 2048, s);
+      dsk::gemm_fp8_p(b.boq, b.bos, R, &ob, 1, kOPart, s);
     } else {
       for (int r0 = 0; r0 < R; r0 += kBatchRows) {
         const int m = std::min(kBatchRows, R - r0);
-        dsk::gemv_woa(bf(b.bo) + (size_t)r0 * 8192, m, w.wo_a, w.wo_a_s, 2048, 4096, 1024, nullptr, cw, false, s,
-                      b.boq + (size_t)r0 * 2048, b.bos + (size_t)r0 * (2048 / 32));
-        dsk::gemv_fp8(b.boq + (size_t)r0 * 2048, b.bos + (size_t)r0 * (2048 / 32), m, w.wo_b, w.wo_b_s, kDim, 2048,
-                      bf(b.bpart) + (size_t)r0 * kDim, cob, s);
+        dsk::gemv_woa(bf(b.bo) + (size_t)r0 * kQ, m, w.wo_a, w.wo_a_s, kOPart, kWoaK, kOGroup, nullptr, cw, false, s,
+                      b.boq + (size_t)r0 * kOPart, b.bos + (size_t)r0 * (kOPart / 32));
+        dsk::gemv_fp8(b.boq + (size_t)r0 * kOPart, b.bos + (size_t)r0 * (kOPart / 32), m, w.wo_b, w.wo_b_s, kDim,
+                      kOPart, bf(b.bpart) + (size_t)r0 * kDim, cob, s);
       }
     }
     comm_->all_reduce(b.bpart, false, b.bsub, (size_t)R * kDim, s);  // COLLECTIVE: all-reduce of wo_b's partial

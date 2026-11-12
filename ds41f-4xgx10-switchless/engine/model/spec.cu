@@ -552,12 +552,13 @@ void Model::Impl::bind_spec(dsw::WeightFile& wf, const dsw::WeightFile* draft) {
   // in each draft, the same bits
   dspark::Weights dw = draft ? dspark::weights_from({draft, &wf}) : dspark::weights_from({&wf});
   float* hc_tmp = dalloc<float>((size_t)kMix * kHcDim);
+  const size_t hcb = (size_t)kMix * kHcDim * 4 / kRanks;  // one rank's slice: [kMix / kRanks][kHcDim] fp32
   for (dspark::BlockW& b : dw.b) {
     for (int h = 0; h < 2; ++h) {
       float* all = dalloc<float>((size_t)kMix * kHcDim);
-      comm::allgather(ch, h ? b.ffn_fn : b.attn_fn, hc_tmp, (size_t)kMix * kDim * 4, st);  // rank r: [24][5120r, +5120)
+      comm::allgather(ch, h ? b.ffn_fn : b.attn_fn, hc_tmp, hcb, st);  // rank r: [24][5120r, +5120)
       for (int r = 0; r < kRanks; ++r)
-        CUDA_CHECK(cudaMemcpy2DAsync(all + (size_t)kDim * r, (size_t)kHcDim * 4, hc_tmp + (size_t)kMix * kDim * r,
+        CUDA_CHECK(cudaMemcpy2DAsync(all + (size_t)kDim * r, (size_t)kHcDim * 4, hc_tmp + (hcb / 4) * r,
                                      (size_t)kDim * 4, (size_t)kDim * 4, kMix, cudaMemcpyDeviceToDevice, st));
       (h ? b.ffn_fn_all : b.attn_fn_all) = all;
       sp.whole.push_back(all);

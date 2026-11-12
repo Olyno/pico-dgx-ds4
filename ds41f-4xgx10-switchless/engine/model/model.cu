@@ -373,9 +373,10 @@ void Model::Impl::bind(dsw::WeightFile& wf, comm::Ring& ring) {
       } else {
         if (!hc_local) hc_local = dalloc<float>((size_t)kMix * kHcDim);
         comm::allgather(ch, local, hc_local, bytes, st);
-        for (int r = 0; r < kRanks; ++r)
-          CUDA_CHECK(cudaMemcpy2DAsync(w.hc_fn[h] + (size_t)kDim * r, (size_t)kHcDim * 4, hc_local + (size_t)kMix * kDim * r,
-                                       (size_t)kDim * 4, (size_t)kDim * 4, kMix, cudaMemcpyDeviceToDevice, st));
+        for (int r = 0; r < kRanks; ++r)  // rank r's slice starts at r * bytes, a [kMix / kRanks][kHcDim] block
+          CUDA_CHECK(cudaMemcpy2DAsync(w.hc_fn[h] + (size_t)kDim * r, (size_t)kHcDim * 4,
+                                       hc_local + (bytes / 4) * r, (size_t)kDim * 4, (size_t)kDim * 4, kMix,
+                                       cudaMemcpyDeviceToDevice, st));
       }
       w.hc_base[h] = reinterpret_cast<const float*>(need(n + "base", DType::F32, {kMix}));
       w.hc_scale[h] = reinterpret_cast<const float*>(need(n + "scale", DType::F32, {3}));

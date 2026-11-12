@@ -1,4 +1,4 @@
-// Attention-side kernels for one rank at TP=4: RoPE, q/kv norms, the sliding-window and compressed
+// Attention-side kernels for one rank of the built world: RoPE, q/kv norms, the sliding-window and compressed
 // KV state, the compressor, the indexer (scores, top-k, layer 20's candidate pool), sparse attention
 // and mHC. The FP8 projections around them (wq_a, wq_b, wkv, the indexer's wq_b, wo_a, wo_b) belong
 // to engine/kernels; these kernels start from their bf16 outputs.
@@ -10,13 +10,15 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "common/world.h"
+
 namespace attn {
 
-inline constexpr int kDim = 5120;      // model width
-inline constexpr int kHead = 512;      // latent / head dim (MQA: one latent shared by all heads)
+inline constexpr int kDim = world::kHidden;  // model width
+inline constexpr int kHead = world::kLatent;  // latent / head dim (MQA: one latent shared by all heads)
 inline constexpr int kRope = 64;       // rotary dims, the last 64 of a head
-inline constexpr int kHeads = 16;      // query heads per rank (64 / TP4)
-inline constexpr int kQLora = 1280;
+inline constexpr int kHeads = world::kHeads / world::kWorld;  // query heads per rank (16 at world 4)
+inline constexpr int kQLora = world::kQLora;
 inline constexpr int kWindow = 128;
 inline constexpr int kRing = 256;      // window ring slots: window + room for verify rows
 inline constexpr int kIdxHeads = 32, kIdxDim = 128;

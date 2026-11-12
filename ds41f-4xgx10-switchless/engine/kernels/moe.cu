@@ -1,6 +1,7 @@
-// MoE of one decode / verify step, per rank at TP=4: the routed MXFP4 experts (576-row slices of
-// w1/w3, 576-column slices of w2) and the FP8 shared expert, for M <= 16 rows (from 9 rows the _r16
-// kernels: the MMAs' upper half carries rows 8..15, the union holds up to 96 experts).
+// MoE of one decode / verify step, per rank of the built world (world 4: 576-row slices of w1/w3 and
+// 576-column slices of w2, dsk::kInter): the routed MXFP4 experts and the FP8 shared expert, for M <= 16
+// rows (from 9 rows the _r16 kernels: the MMAs' upper half carries rows 8..15, the union holds up to 96
+// experts).
 //
 // Two kernels. moe_up: for every expert in the union of the rows' picks (each read once), w1 and w3
 // in one task per 32 intermediate rows, then SwiGLU (up clamped to +-10, gate to <= 10), the routing
@@ -19,8 +20,9 @@ namespace dsk {
 
 namespace {
 
-constexpr int kDim = 5120, kInter = 576;  // per rank
-constexpr int kJB = kInter / 32;          // 18 blocks of 32 intermediate rows
+constexpr int kDim = world::kHidden;                        // the model width
+constexpr int kInter = world::kExpertInter / world::kWorld;  // expert columns per rank (576 at world 4)
+constexpr int kJB = kInter / 32;          // blocks of 32 intermediate rows (18 at world 4)
 constexpr int kKB1 = kDim / 32, kKB2 = kInter / 32;
 constexpr int kP1 = kDim / 64, kP2 = kInter / 64;  // steps of two k-blocks: 80 (w1/w3), 9 (w2)
 constexpr size_t kW13 = (size_t)kInter * kDim / 2, kS13 = (size_t)kInter * kKB1;  // bytes per expert

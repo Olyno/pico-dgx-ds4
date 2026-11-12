@@ -1,5 +1,6 @@
 // The attention side of prefill (M5, part 2): sparse attention, the indexer, the compressor and mHC
-// for chunks of 2048-8192 rows at per-rank shapes (TP=4, 16 heads). State, formats and numerics are
+// for chunks of 2048-8192 rows at the built world's per-rank shapes (16 query heads per rank at world 4,
+// which is the head mapping these kernels implement). State, formats and numerics are
 // engine/attn's (attn/attn.h): these are the many-row versions of its decode-shaped kernels and are
 // tested against them. Rows are a chunk's query tokens in ascending position order.
 #pragma once

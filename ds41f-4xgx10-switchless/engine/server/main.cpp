@@ -452,7 +452,10 @@ Args parse(int argc, char** argv) {
   if (a.rank < 0)
     die("cannot tell this box's rank: its hostname is no RANK<r>_HOSTNAME in the fleet file %s; pass --rank",
         fl.file.c_str());
-  if (a.rank > 3) die("--rank %d: the ring's ranks are 0-3", a.rank);
+  if (a.rank >= comm::kRanks)
+    die("--rank %d: this engine is built for world %d, so its ranks are 0-%d (rebuild with -DDSGB10_WORLD=%d for a "
+        "bigger world)",
+        a.rank, comm::kRanks, comm::kRanks - 1, a.rank + 1);
   const comm::RankAddr& me = fl.rank[a.rank];
   const std::string r = std::to_string(a.rank);
   // a path flag's value, else the fleet's: {rank} is this rank, a leading ~/ this box's home (the same
@@ -467,8 +470,9 @@ Args parse(int argc, char** argv) {
     path(a.hashmap, me.hashmap, "HASHMAP", "--hashmap");
     std::string dir = me.engram;
     while (dir.size() > 1 && dir.back() == '/') dir.pop_back();
-    path(a.shard[0], dir.empty() ? "" : dir + "/engram-l1-r" + r + "of4.bin", "ENGRAM", "--shard1");
-    path(a.shard[1], dir.empty() ? "" : dir + "/engram-l14-r" + r + "of4.bin", "ENGRAM", "--shard14");
+    const std::string of = "of" + std::to_string(engram::kWorld) + ".bin";  // the shards' world (the build's)
+    path(a.shard[0], dir.empty() ? "" : dir + "/engram-l1-r" + r + of, "ENGRAM", "--shard1");
+    path(a.shard[1], dir.empty() ? "" : dir + "/engram-l14-r" + r + of, "ENGRAM", "--shard14");
   }
   if (a.mode == "serve") path(a.disk_dir, me.spill, "SPILL", "--disk-dir");
   a.engram_read_batch = me.engram_read_batch;
@@ -569,7 +573,7 @@ void mem_report(int rank, const char* when) {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
-  tp::require_engine(comm::kRanks, "dsgb10_rank");  // TP != 4 dies here, before the fleet or weights
+  tp::require_engine("dsgb10_rank");  // $TP != the build's world dies here, before the fleet or weights
   const Args a = parse(argc, argv);
   const double t0 = now_s();
   std::printf("rank %d (%s): the fleet file %s; weights %s", a.rank, comm::fleet(a.fleet).rank[a.rank].name.c_str(),

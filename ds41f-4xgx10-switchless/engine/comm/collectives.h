@@ -8,39 +8,40 @@
 
 namespace comm {
 
-// out = in_0 + in_1 + in_2 + in_3 summed in fp32 in rank order (bit-identical on every rank).
+// out = in_0 + .. + in_{kRanks-1} summed in fp32 in rank order (bit-identical on every rank).
 // n elements; n * sizeof(element) must be a multiple of 16 and at most ch.cap. in and out may alias.
 void allreduce_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfloat16* out, size_t n, cudaStream_t st);
 void allreduce_f32(const DevChannel& ch, const float* in, float* out, size_t n, cudaStream_t st);
 
-// out = [in_0 | in_1 | in_2 | in_3], each nbytes (a multiple of 16). Above ch.cap it runs in
+// out = [in_0 | .. | in_{kRanks-1}], each nbytes (a multiple of 16). Above ch.cap it runs in
 // pipelined chunks (16 blocks), e.g. Engram's packed row segments (engine/engram/engram.h).
 void allgather(const DevChannel& ch, const void* in, void* out, size_t nbytes, cudaStream_t st);
 
-// out = quarter `rank` of in_0 + in_1 + in_2 + in_3 (same order and rounding as the all-reduce): in
-// has n elements on every rank, out n / 4. n * sizeof(element) must be a multiple of 64, at most ch.cap.
+// out = part `rank` of in_0 + .. + in_{kRanks-1} (same order and rounding as the all-reduce): in
+// has n elements on every rank, out n / kRanks. n * sizeof(element) must be a multiple of 64, at most
+// ch.cap.
 void reduce_scatter_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfloat16* out, size_t n, cudaStream_t st);
 void reduce_scatter_f32(const DevChannel& ch, const float* in, float* out, size_t n, cudaStream_t st);
 
 // All-reduce of any size, bit-identical to allreduce_bf16/f32: chunks of up to ch.cap bytes, each a
-// reduce-scatter followed by an all-gather of the reduced quarters (0.875 instead of 1.5 times the
-// payload per link and direction), in one kernel of `blocks` blocks (few, so that other work can run
-// alongside). n * sizeof(element) must be a multiple of 64; in and out may alias.
+// reduce-scatter followed by an all-gather of the reduced parts (0.875 instead of 1.5 times the
+// payload per link and direction on the four-box ring), in one kernel of `blocks` blocks (few, so that
+// other work can run alongside). n * sizeof(element) must be a multiple of 64; in and out may alias.
 void allreduce_bulk_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfloat16* out, size_t n, cudaStream_t st,
                          int blocks = 16);
 void allreduce_bulk_f32(const DevChannel& ch, const float* in, float* out, size_t n, cudaStream_t st, int blocks = 16);
 
-// Reduce-scatter of any size: in has n elements on every rank, four quarters (quarter k for rank k),
-// out gets this rank's quarter summed as reduce_scatter_bf16/f32 does (bit-identical). Pipelined one
-// deep in posts of up to ch.cap bytes (a piece of every quarter each), in one kernel of `blocks`
+// Reduce-scatter of any size: in has n elements on every rank, kRanks equal parts (part k for rank k),
+// out gets this rank's part summed as reduce_scatter_bf16/f32 does (bit-identical). Pipelined one
+// deep in posts of up to ch.cap bytes (a piece of every part each), in one kernel of `blocks`
 // blocks. n * sizeof(element) must be a multiple of 64; out must not overlap in except at this rank's
-// own quarter (out == in + rank * n / 4 works: each piece is read before its sum is written).
+// own part (out == in + rank * n / kRanks works: each piece is read before its sum is written).
 void reduce_scatter_bulk_bf16(const DevChannel& ch, const __nv_bfloat16* in, __nv_bfloat16* out, size_t n,
                               cudaStream_t st, int blocks = 16);
 void reduce_scatter_bulk_f32(const DevChannel& ch, const float* in, float* out, size_t n, cudaStream_t st,
                              int blocks = 16);
 
-// The same by rows of a column block: in is [4 rows][ld_in] elements and quarter k its rows
+// The same by rows of a column block: in is [kRanks rows][ld_in] elements and part k its rows
 // [k rows, (k + 1) rows), columns [0, cols) (offset in to the block's first column); out is [rows][ld_out].
 // cols * sizeof(element) must be a multiple of 16; the sums are those of reduce_scatter_bulk_*.
 void reduce_scatter_rows_bf16(const DevChannel& ch, const __nv_bfloat16* in, size_t ld_in, __nv_bfloat16* out,
@@ -48,8 +49,8 @@ void reduce_scatter_rows_bf16(const DevChannel& ch, const __nv_bfloat16* in, siz
 void reduce_scatter_rows_f32(const DevChannel& ch, const float* in, size_t ld_in, float* out, size_t ld_out, int rows,
                              int cols, cudaStream_t st, int blocks = 16);
 
-// All-gather of several buffers in one pipelined collective: for each segment, out = [in_0 | in_1 |
-// in_2 | in_3] of `bytes` each (a multiple of 16). in may be out + rank * bytes (in place).
+// All-gather of several buffers in one pipelined collective: for each segment, out = [in_0 | .. |
+// in_{kRanks-1}] of `bytes` each (a multiple of 16). in may be out + rank * bytes (in place).
 struct AgSeg {
   const void* in;
   void* out;
@@ -58,11 +59,11 @@ struct AgSeg {
 constexpr int kMaxAgSegs = 6;
 void allgather_multi(const DevChannel& ch, const AgSeg* segs, int nseg, cudaStream_t st, int blocks = 16);
 
-// All-to-all by rows: quarter k of each segment (rows [k rows, (k + 1) rows) of in, row stride ld_in
-// bytes) goes to rank k, and rank k's quarter for this rank lands at out + (k rows + r) ld_out. Rows are
-// rb bytes (multiples of 16, as the strides). Per quarter the segments form one stream, sent in posts of
+// All-to-all by rows: part k of each segment (rows [k rows, (k + 1) rows) of in, row stride ld_in
+// bytes) goes to rank k, and rank k's part for this rank lands at out + (k rows + r) ld_out. Rows are
+// rb bytes (multiples of 16, as the strides). Per part the segments form one stream, sent in posts of
 // up to ch.cap bytes on the reduce-scatter's transport (0.5 n per link and direction, n = the bytes of
-// all four quarters), in one kernel of `blocks` blocks of 256 threads (small, so that work can share
+// all kRanks parts), in one kernel of `blocks` blocks of 256 threads (small, so that work can share
 // their SMs).
 struct A2aSeg {
   const void* in;

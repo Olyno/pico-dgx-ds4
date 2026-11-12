@@ -36,7 +36,7 @@ struct OutTensor {
 };
 
 struct Plan {
-  int rank = 0, world = 4;
+  int rank = 0, world = 0;  // both set by make_plan: the cutter serves any world, not the build's
   std::vector<OutTensor> tensors;  // file order
   std::vector<std::string> skipped;
   uint64_t toc_offset = 0, data_offset = 0, file_bytes = 0;

@@ -1,4 +1,4 @@
-// Collectives for the four-box ring: device side (see ring.h).
+// Collectives for the built world's ring: device side (see ring.h).
 //
 // A collective has a producer half and a consumer half, which can live in different kernels so they
 // fuse into neighbouring work (a GEMV epilogue publishes, the next kernel's prologue reduces):
@@ -9,7 +9,7 @@
 //                                                    // (reduce-scatter: post_grid(ch, s, nbytes, kOpReduceScatter))
 //   --- (same or a later kernel; that kernel also reads s = next_seq(ch)) ---
 //   comm::wait_all(ch, s);                           // every block
-//   ... read comm::src(ch, s, k) for k = 0..3, e.g. comm::sum8_bf16 ...
+//   ... read comm::src(ch, s, k) for k = 0..kRanks-1, e.g. comm::sum8_bf16 ...
 //   comm::finish_grid(ch, s);                        // every block; the last one advances ch.seq
 //
 // Rules: collectives run in the same order on every rank; producer and consumer of one collective
@@ -89,7 +89,7 @@ __device__ __forceinline__ void post_grid(const DevChannel& ch, uint64_t s, uint
   }
 }
 
-// Consumer: every block waits until the four contributions to collective s are complete. In block
+// Consumer: every block waits until every rank's contribution to collective s is complete. In block
 // 0, lanes 0-5 of the first warp each poll one arrival flag and lane 6 this rank's own doorbell, so
 // no block gets past wait_all(s) before every block of the grid has passed post_grid(s) (a grid
 // barrier, which kernels that run several collectives in a row rely on). Block 0 then passes the

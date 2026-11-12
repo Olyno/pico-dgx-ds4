@@ -7,11 +7,18 @@
 #pragma once
 #include <string>
 
+#include "common/world.h"
+
 namespace comm {
 
-constexpr int kRanks = 4;
+// The world this binary is built for (common/world.h). At 4 every rank has two distinct neighbours and
+// an opposite rank; at 2 the one peer is both neighbours and the opposite rank is this rank itself, so
+// nothing is relayed; at 1 there is no collective at all (the ring runs in its loopback mode).
+constexpr int kRanks = world::kWorld;
 constexpr int kDomains = 2;
-constexpr int kSlowLink = 0;  // link i joins ranks i and i + 1; L0 (ranks 0 - 1) is 100G, the others 200G
+// Link i joins ranks i and i + 1; L0 (ranks 0 - 1) is 100G, the others 200G. The reduce-scatter's
+// slow-link split needs the four-box ring; at world 2 there is one link and no relay to split.
+constexpr int kSlowLink = 0;
 
 struct RankAddr {
   std::string name;                // RANK<r>_NAME: the box's name in logs

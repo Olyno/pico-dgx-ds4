@@ -2,15 +2,17 @@
 //
 // Every position hashes the 2-, 3- and 4-gram ending there into 24 rows per Engram layer
 // (3 n-gram sizes x 8 heads). The rows live on NVMe in the kit's per-rank shards: rank r owns the
-// rows [rows*r/4, rows*(r+1)/4) of each layer's table, as 264-byte records (256 e4m3 values and 8
-// ue8m0 scales, one per 32). Each rank reads the rows it owns through io_uring, behind a hot-row
-// cache, packs them in a fixed order, and the comm all-gather gives every rank all 24 rows.
+// rows [rows*r/kWorld, rows*(r+1)/kWorld) of each layer's table, as 264-byte records (256 e4m3 values
+// and 8 ue8m0 scales, one per 32). Each rank reads the rows it owns through io_uring, behind a
+// hot-row cache, packs them in a fixed order, and the comm all-gather gives every rank all 24 rows.
 #pragma once
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include "common/world.h"
 
 namespace engram {
 
@@ -21,7 +23,7 @@ constexpr int kHeads = 8;
 constexpr int kCols = kOrders * kHeads;  // rows per position per layer: order-major, then head
 constexpr int kRowBytes = 264;           // 256 e4m3 + 8 ue8m0
 constexpr int kWeightBytes = 256;
-constexpr int kWorld = 4;
+constexpr int kWorld = world::kWorld;  // the shards are engram-l{layer}-r{rank}of{kWorld}.bin
 
 // ---- hashing --------------------------------------------------------------------------------
 
@@ -50,7 +52,7 @@ void hash_positions(const HashMap& m, const int32_t* tokens, const uint8_t* live
 
 // ---- who owns which rows --------------------------------------------------------------------
 
-// The kit's split: rank r owns [rows*r/4, rows*(r+1)/4) of each layer's table.
+// The kit's split: rank r owns [rows*r/kWorld, rows*(r+1)/kWorld) of each layer's table.
 struct Split {
   int64_t lo[kLayers][kWorld + 1] = {};
   static Split of(const HashMap& m);
@@ -90,7 +92,7 @@ enum class Source {
 struct StoreConfig {
   int rank = 0;                       // rows of this rank; -1 serves every row (single-box mode)
   Source source = Source::KitShard;
-  std::string shard[kLayers];         // KitShard: engram-l1-r{rank}of4.bin, engram-l14-r{rank}of4.bin
+  std::string shard[kLayers];         // KitShard: engram-l1-r{rank}of{kWorld}.bin, engram-l14-r{rank}of{kWorld}.bin
   std::string checkpoint;             // Checkpoint: the checkpoint directory
   size_t cache_bytes = size_t(4) << 30;  // hot-row cache; 0 disables it
   int queue_depth = 128;              // reads in flight

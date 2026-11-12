@@ -95,10 +95,10 @@ fleet_rank() {
 # fleet_model_files R: rank R's weight file, hash map and Engram shards, quoted for a command line
 # (tools/evict_cache.py takes them, and expands their ~/ on the box that runs it)
 fleet_model_files() {
-  local e w h
+  local e w h of="${TP:-4}"  # the shards' world: the engine's build world, which $TP must agree with
   w=$(fleet_rank "$(fleet_get "RANK${1}_WEIGHTS")" "$1") h=$(fleet_rank "$(fleet_get "RANK${1}_HASHMAP")" "$1")
   e=$(fleet_rank "$(fleet_get "RANK${1}_ENGRAM")" "$1")
   [ -z "$w" ] || printf "'%s' " "$w"
   [ -z "$h" ] || printf "'%s' " "$h"
-  [ -z "$e" ] || printf "'%s' '%s' " "$e/engram-l1-r${1}of4.bin" "$e/engram-l14-r${1}of4.bin"
+  [ -z "$e" ] || printf "'%s' '%s' " "$e/engram-l1-r${1}of${of}.bin" "$e/engram-l14-r${1}of${of}.bin"
 }

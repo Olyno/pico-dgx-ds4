@@ -1,4 +1,4 @@
-// Prefill GEMMs (M5): chunks of M = 128..8192 rows at per-rank TP=4 shapes, on tensor cores, reading
+// Prefill GEMMs (M5): chunks of M = 128..8192 rows at the built world's per-rank shapes, on tensor cores, reading
 // the decode weight layouts unchanged (L1 tile_fp8, L2 = bf16 rows through tile_fp8, L3 tile_fp4):
 //  - gemm_fp8_p: FP8 x FP8 block-scaled GEMM (mma.sync kind::mxf8f6f4.block_scale m16n8k32), a
 //    multistage cp.async pipeline into XOR-swizzled shared memory, ldmatrix fragments; epilogues:
@@ -22,9 +22,10 @@ namespace dsk {
 
 namespace {
 
-constexpr int kDimP = 5120, kInterP = 576;
-constexpr int kKB1P = kDimP / 32, kKB2P = kInterP / 32;  // 160, 18 scale blocks per row
-constexpr int kP1P = kDimP / 64, kP2P = kInterP / 64;    // 80, 9 steps of 64
+constexpr int kDimP = world::kHidden;                          // the model width
+constexpr int kInterP = world::kExpertInter / world::kWorld;   // expert columns per rank (576 at world 4)
+constexpr int kKB1P = kDimP / 32, kKB2P = kInterP / 32;  // scale blocks per row (160, 18 at world 4)
+constexpr int kP1P = kDimP / 64, kP2P = kInterP / 64;    // steps of 64 (80, 9 at world 4)
 constexpr size_t kW13P = (size_t)kInterP * kDimP / 2, kS13P = (size_t)kInterP * kKB1P;
 constexpr size_t kW2P = (size_t)kDimP * kInterP / 2, kS2P = (size_t)kDimP * kKB2P;
 constexpr int kTileRows = 64;  // rows (token, expert pairs) per grouped-GEMM tile
@@ -608,7 +609,7 @@ void launch_gemm16(const G16Args& a, cudaStream_t st) {
              a);
 }
 
-// Four bf16 partials summed in fp32 in order, rounded once (comm's sum8_bf16 and reduce16).
+// One bf16 partial per rank, summed in fp32 in rank order, rounded once (comm's sum8_bf16 and reduce16).
 __global__ void k_sum4_bf16(const uint4* __restrict__ part, size_t slot16, size_t n16, uint4* __restrict__ out) {
   pdl_launch_dependents();
   pdl_wait();
@@ -616,7 +617,7 @@ __global__ void k_sum4_bf16(const uint4* __restrict__ part, size_t slot16, size_
     float s[8], f[8];
     bf16x8(part[i], s);
 #pragma unroll
-    for (int k = 1; k < 4; ++k) {
+    for (int k = 1; k < world::kWorld; ++k) {
       bf16x8(part[k * slot16 + i], f);
 #pragma unroll
       for (int j = 0; j < 8; ++j) s[j] += f[j];

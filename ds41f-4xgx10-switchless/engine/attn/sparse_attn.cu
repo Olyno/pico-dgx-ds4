@@ -339,6 +339,13 @@ __global__ void __launch_bounds__(128) attn_combine_kernel(const float* po, cons
 void sparse_attn(const uint16_t* q_pre, const int* pos, WinBounds wb, int rows, const float2* table, Window win,
                  Compressed ckv, const int* topk, int kmax, const float* sink, uint16_t* out, int splits,
                  AttnScratch scratch, cudaStream_t s, bool pdl) {
+  // attn_kernel's mapping is 16 query heads per rank: 4 warps of 128 dims, each lane group holding heads
+  // g and g + 8. That is the four-box world's slice (64 / 4); another world's heads per rank need another
+  // mapping, so this refuses instead of computing another world's attention.
+  if (kHeads != 16)
+    die("attn: sparse_attn is built for 16 query heads per rank (world 4); this engine is built for world %d "
+        "(%d heads per rank), whose attention kernel is not written yet",
+        world::kWorld, kHeads);
   static bool once = [] {
     CUDA_CHECK(cudaFuncSetAttribute(attn_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kAttnSmem));
     return true;

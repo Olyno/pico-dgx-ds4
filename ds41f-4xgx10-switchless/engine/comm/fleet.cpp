@@ -87,7 +87,18 @@ Fleet read_fleet(const std::string& file) {
     if (!ok) die("comm: %s:%d: not KEY=value (a value has no spaces or quotes): %s", file.c_str(), n, line.c_str());
     const std::string key = line.substr(0, k);
     const auto it = keys.find(key);
-    if (it == keys.end()) die("comm: %s:%d: unknown key %s", file.c_str(), n, key.c_str());
+    if (it == keys.end()) {
+      // A rank this build does not have: say which world the file is for, not just "unknown key".
+      if (key.rfind("RANK", 0) == 0) {
+        size_t d = 4;
+        while (d < key.size() && key[d] >= '0' && key[d] <= '9') d++;
+        if (d > 4 && d < key.size() && key[d] == '_' && std::atoi(key.c_str() + 4) >= kRanks)
+          die("comm: %s:%d: %s is rank %d of a bigger world, but this engine is built for world %d "
+              "(rebuild with -DDSGB10_WORLD, or use a fleet file of %d ranks)",
+              file.c_str(), n, key.c_str(), std::atoi(key.c_str() + 4), kRanks, kRanks);
+      }
+      die("comm: %s:%d: unknown key %s", file.c_str(), n, key.c_str());
+    }
     if (seen.count(key)) die("comm: %s:%d: %s again (line %d)", file.c_str(), n, key.c_str(), seen[key]);
     seen[key] = n;
     *it->second = line.substr(v, e - v);

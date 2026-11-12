@@ -1,12 +1,18 @@
-// Collectives for the four-box ring (DESIGN.md decision 2, docs/ring.md): host side.
+// Collectives for the ring of the built world (DESIGN.md decision 2, docs/ring.md): host side.
 //
 // Every collective is an all-exchange: each rank's contribution reaches every other rank, the two
 // neighbours directly and the opposite rank through a neighbour's CPU proxy (half of it through
-// each neighbour). Consumers then reduce in fixed rank order 0,1,2,3 (all-reduce) or read the four
-// contributions in place (all-gather), so every rank computes bit-identical results. A
-// reduce-scatter post sends each rank only its own quarter of the contribution, the same way; large
-// all-reduces are a reduce-scatter and an all-gather of the reduced quarters (0.875 instead of 1.5
-// times the payload per link and direction).
+// each neighbour). Consumers then reduce in fixed rank order 0..kRanks-1 (all-reduce) or read the
+// kRanks contributions in place (all-gather), so every rank computes bit-identical results. A
+// reduce-scatter post sends each rank only its own part of the contribution, the same way; large
+// all-reduces are a reduce-scatter and an all-gather of the reduced parts (0.875 instead of 1.5
+// times the payload per link and direction on the four-box ring).
+//
+// The world is the build's (common/world.h). At 4 this is the ring above. At 2 the one peer is both
+// neighbours and the opposite rank is this rank itself: nothing is relayed, each rank writes its
+// contribution (reduce-scatter: the peer's part) straight to the peer, and the device side reads the
+// peer's contribution from one buffer. At 1 there is no peer: the ring runs in its loopback mode and
+// every collective is this rank's own buffer.
 //
 // Buffers live in one host region (cuMemCreate on the host NUMA node: CPU- and GPU-mapped at the
 // same address, registered with every RDMA device). Collective s uses buffer set s % kSlots. A rank
@@ -34,7 +40,7 @@ struct alignas(64) Flag {
 };
 
 // What a post sends. kOpAllExchange: the whole contribution to every rank. kOpReduceScatter: the
-// contribution is four quarters, quarter k for rank k; rank k receives quarter k of every other
+// contribution is kRanks equal parts, part k for rank k; rank k receives part k of every other
 // rank's contribution, at the same offset as in the sender's buffer.
 enum Op : uint32_t { kOpAllExchange = 0, kOpReduceScatter = 1 };
 
@@ -80,8 +86,8 @@ struct Options {
   // (each NIC function DMA-reads its half in parallel); smaller ones use domain 0 only.
   uint32_t split_domains_from = 4096;
   int relay_domain = 1;  // the PCI domain all-exchange relays travel on (reduce-scatter: the other)
-  // Reduce-scatter: percent of the opposite rank's quarter that takes the path across the slow link
-  // (kSlowLink); the rest goes the other way round. 50 splits it evenly. 25 would load L0 with 1.5
+  // Reduce-scatter on the four-box ring: percent of the opposite rank's part that takes the path across
+  // the slow link (kSlowLink); the rest goes the other way round. 50 splits it evenly. 25 would load L0 with 1.5
   // instead of 2 quarters per direction, as much as the busier PCI domain of a 200G link, but measured
   // slower (14.4 against 18.4 GB/s at 64 MiB): relays are store-and-forward, so a post's time follows
   // its larger relayed part over two hops, not the links' loads.
@@ -93,6 +99,8 @@ struct Options {
   // (checked at the bootstrap). -1: from the environment (DSGB10_RING_DIRECT=1), off if unset.
   // 2: also send a small contribution (below split_domains_from) to each neighbour as one write and one write of
   // both flags, instead of two halves with a flag each (the halves existed so a relay could start early).
+  // The four-box ring's only: at world 2 the opposite rank is this rank itself (nothing to write it directly)
+  // and at world 1 there is no peer, so a build for those worlds refuses it (the constructor dies).
   int direct = -1;
 };
 
@@ -127,7 +135,7 @@ class Ring {
 
   // Host-side helpers over the bootstrap sockets (setup and tests only, ~100 µs).
   void barrier();
-  void allgather_host(const void* mine, void* all, size_t n);  // all = 4 × n bytes, rank order
+  void allgather_host(const void* mine, void* all, size_t n);  // all = kRanks × n bytes, rank order
 
  private:
   struct Impl;

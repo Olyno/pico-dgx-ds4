@@ -35,7 +35,7 @@ __device__ __forceinline__ void stall_for_test(size_t i, size_t npieces) {
 #define TEST_STALL(i, npieces) ((void)0)
 #endif
 
-// The sum of the four contributions' 16 bytes at offset off, as 16 bytes of the same element type.
+// The sum of every contribution's 16 bytes at offset off, as 16 bytes of the same element type.
 template <bool kBf16>
 __device__ __forceinline__ uint4 reduce16(const DevChannel& ch, uint64_t s, size_t off) {
   if constexpr (kBf16) {
@@ -71,7 +71,7 @@ template <bool kBf16>
 __global__ void __launch_bounds__(kThreads) reduce_scatter_kernel(DevChannel ch, const uint4* in, uint4* out, uint32_t nbytes) {
   const uint64_t s = next_seq(ch);
   uint4* sb = (uint4*)send_buf(ch, s);
-  const uint32_t chunks = nbytes / 16, qchunks = chunks / 4;
+  const uint32_t chunks = nbytes / 16, qchunks = chunks / kRanks;
   const uint32_t t0 = blockIdx.x * blockDim.x + threadIdx.x, stride = gridDim.x * blockDim.x;
   for (uint32_t c = t0; c < chunks; c += stride) sb[c] = in[c];
   post_grid(ch, s, nbytes, kOpReduceScatter);
@@ -102,18 +102,18 @@ __global__ void __launch_bounds__(kThreads) allreduce_bulk_kernel(DevChannel ch,
     for (uint32_t j = t0; j < chunks; j += stride) sb[j] = cin[j];
     post_grid(ch, s, len(i), kOpReduceScatter);
   };
-  // reduce this rank's quarter of chunk i's reduce-scatter s and post it as all-gather s + 1
+  // reduce this rank's part of chunk i's reduce-scatter s and post it as all-gather s + 1
   auto reduce = [&](size_t i, uint64_t s) {
-    const uint32_t qchunks = len(i) / 64;
+    const uint32_t qchunks = len(i) / (16 * kRanks);
     wait_all(ch, s);
     uint4* red = (uint4*)send_buf(ch, s + 1);
     const size_t qoff = (size_t)ch.rank * qchunks * 16;
     for (uint32_t j = t0; j < qchunks; j += stride) red[j] = reduce16<kBf16>(ch, s, qoff + (size_t)j * 16);
-    post_grid(ch, s + 1, len(i) / 4);
+    post_grid(ch, s + 1, len(i) / kRanks);
   };
   // copy chunk i's all-gather s + 1 out (it has arrived)
   auto gather = [&](size_t i, uint64_t s) {
-    const uint32_t qchunks = len(i) / 64;
+    const uint32_t qchunks = len(i) / (16 * kRanks);
     uint4* cout = out + i * (chunk / 16);
     for (int k = 0; k < kRanks; k++) {
       const uint8_t* p = src(ch, s + 1, k);
@@ -179,8 +179,8 @@ __global__ void __launch_bounds__(kThreads) allgather_bulk_kernel(DevChannel ch,
 }
 
 // Reduce-scatter of more than cap bytes: post i carries piece i (`piece` bytes, the last one shorter)
-// of every quarter, so quarter k of the send buffer is again rank k's. A quarter is `rows` rows of
-// `rb` bytes (row r of quarter k at in + (k rows + r) ld_in bytes; its sum at out + r ld_out), taken
+// of every part, so part k of the send buffer is again rank k's. A part is `rows` rows of
+// `rb` bytes (row r of part k at in + (k rows + r) ld_in bytes; its sum at out + r ld_out), taken
 // as one stream of rows * rb bytes. Pipelined with the copies ahead:
 // piece i + 1 is copied into its send buffer while i travels, so that it is posted the moment i has
 // arrived; then i is reduced and i + 2 copied in while i + 1 travels. The copy of s + 2 reuses the
@@ -210,12 +210,12 @@ __global__ void __launch_bounds__(kThreads) reduce_scatter_bulk_kernel(DevChanne
     }
   };
   copy(0, s0);
-  post_grid(ch, s0, 4 * len(0), kOpReduceScatter);
+  post_grid(ch, s0, kRanks * len(0), kOpReduceScatter);
   if (npieces > 1) copy(1, s0 + 1);
   for (size_t i = 0; i < npieces; i++) {
     const uint64_t s = s0 + i;
     wait_all(ch, s);
-    if (i + 1 < npieces) post_grid(ch, s + 1, 4 * len(i + 1), kOpReduceScatter);
+    if (i + 1 < npieces) post_grid(ch, s + 1, kRanks * len(i + 1), kOpReduceScatter);
     TEST_STALL(i, npieces);
     const uint32_t pl = len(i) / 16;
     const size_t u0 = i * (piece / 16), qoff = (size_t)ch.rank * pl * 16;
@@ -321,12 +321,12 @@ __global__ void __launch_bounds__(kA2aThreads) alltoall_rows_kernel(DevChannel c
     }
   };
   copy(0, s0);
-  post_grid(ch, s0, 4 * len(0), kOpReduceScatter);
+  post_grid(ch, s0, kRanks * len(0), kOpReduceScatter);
   if (npieces > 1) copy(1, s0 + 1);
   for (size_t i = 0; i < npieces; i++) {
     const uint64_t s = s0 + i;
     wait_all(ch, s);
-    if (i + 1 < npieces) post_grid(ch, s + 1, 4 * len(i + 1), kOpReduceScatter);
+    if (i + 1 < npieces) post_grid(ch, s + 1, kRanks * len(i + 1), kOpReduceScatter);
     TEST_STALL(i, npieces);
     const uint32_t pl = len(i) / 16;
     const size_t qoff = (size_t)ch.rank * pl * 16;
@@ -387,7 +387,7 @@ void rs_bulk(const DevChannel& ch, const void* in, size_t ld_in, void* out, size
              cudaStream_t st, int blocks) {
   if (rb % 16 || !rb || !rows || rows * rb > 0xffffffffull * 16 || rb > 0xffffffffu || rows > 0xffffffffu)
     die("comm: bulk reduce-scatter of %zu rows of %zu bytes per quarter (a multiple of 16)", rows, rb);
-  const uint32_t piece = (ch.cap / 4) & ~63u;
+  const uint32_t piece = (ch.cap / kRanks) & ~63u;
   blocks = blocks < 1 ? 1 : blocks > 48 ? 48 : blocks;
   reduce_scatter_bulk_kernel<kBf16><<<blocks, kThreads, 0, st>>>(ch, (const uint8_t*)in, ld_in, (uint8_t*)out, ld_out,
                                                                   (uint32_t)rows, (uint32_t)rb, piece);
@@ -502,7 +502,7 @@ void alltoall_rows(const DevChannel& ch, const A2aSeg* segs, int nseg, int rows,
     a.off[g + 1] = a.off[g] + (size_t)rows * e.rb;
   }
   blocks = blocks < 1 ? 1 : blocks > 48 ? 48 : blocks;
-  alltoall_rows_kernel<<<blocks, kA2aThreads, 0, st>>>(ch, a, (ch.cap / 4) & ~63u);
+  alltoall_rows_kernel<<<blocks, kA2aThreads, 0, st>>>(ch, a, (ch.cap / kRanks) & ~63u);
   CUDA_CHECK(cudaGetLastError());
 }
 

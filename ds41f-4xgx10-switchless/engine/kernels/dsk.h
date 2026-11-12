@@ -1,7 +1,7 @@
 // dsgb10 kernels: the weight-streaming GEMVs of one decode/verify step (M <= 16 activation rows) and
-// the prefill GEMMs (chunks of M rows, prefill.cu), on per-rank (TP=4) shapes. All tensors are device
-// pointers in the checkpoint's own formats: e4m3 (uint8), packed e2m1 (uint8, low nibble first),
-// ue8m0 scales (uint8), bf16.
+// the prefill GEMMs (chunks of M rows, prefill.cu), on per-rank shapes of the built world (common/world.h).
+// All tensors are device pointers in the checkpoint's own formats: e4m3 (uint8), packed e2m1 (uint8,
+// low nibble first), ue8m0 scales (uint8), bf16.
 #pragma once
 #include <cstdint>
 #include <cuda_bf16.h>
@@ -9,11 +9,16 @@
 #include <cstdio>
 #include <cstdlib>
 
+#include "common/world.h"
+
 namespace comm {
 struct DevChannel;
 }
 
 namespace dsk {
+
+// The per-rank expert geometry: the intermediate columns of one expert on this rank (576 at world 4).
+constexpr int kInter = world::kExpertInter / world::kWorld;
 
 // Activation rows per call: a verify step has up to 6, a batched step (docs/batching.md, B4) up to 16.
 // Up to kLowRows the kernels run as they did before B4: an activation row per lane group, in the lower
@@ -183,7 +188,8 @@ void router_topk(const float* logits, const float* bias, int M, int E, int* idx,
 void router_topk_oea(const float* logits, const float* bias, int M, int E, int* idx, float* wts, float route_scale, int k0,
                      int kp, cudaStream_t st);
 
-// ---- MoE (routed MXFP4 experts + FP8 shared expert), per rank at TP=4: dim 5120, 576 intermediate
+// ---- MoE (routed MXFP4 experts + FP8 shared expert), per rank of the built world: dim 5120, kInter
+// (576 at world 4) intermediate
 
 // Re-lay an MXFP4 weight for the MoE kernels: w [N][K/2] (e2m1 pairs, low nibble first) and s
 // [N][K/32] -> wt [N/16][K/64][32 lanes][16 B], st [N/16][K/64][8][4 B]. Lane (g, t) of a 16-row
@@ -235,9 +241,9 @@ struct MoeCfg {
 
 size_t moe_workspace_bytes();
 // The workspace of a call of M rows, with RB = row_budget(M) (tests read moe_up's output from it): hq
-// [RB * kTopK + 1][RB][576] e4m3 (the union's slots, then the shared expert's), at moe_hs_offset(M) hs
-// [..][RB][18] ue8m0; moe_up's task counters at the end.
-constexpr size_t moe_hs_offset(int M) { return (size_t)(row_budget(M) * kTopK + 1) * row_budget(M) * 576; }
+// [RB * kTopK + 1][RB][kInter] e4m3 (the union's slots, then the shared expert's), at moe_hs_offset(M)
+// hs [..][RB][kInter / 32] ue8m0; moe_up's task counters at the end.
+constexpr size_t moe_hs_offset(int M) { return (size_t)(row_budget(M) * kTopK + 1) * row_budget(M) * kInter; }
 
 // y [M][5120] fp32 = sum over each row's picks, in expert-id order, of bf16(expert(x) * weight),
 // plus the shared expert: this rank's partial, before the all-reduce. xq/xs = act_quant(x);

@@ -12,6 +12,18 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# The tensor-parallel world this build serves: one constant (common/world.h) that every per-rank shape
+# derives from. 4 is the fleet's; 2 and 1 divide the checkpoint's shapes too (3 divides none of them).
+# One build per world: $TP must agree with it at startup (common/tp.h), and weights, Engram shards and
+# fleet files cut for another world are refused.
+set(DSGB10_WORLD 4 CACHE STRING "Tensor-parallel world this build serves: 1, 2 or 4")
+if(NOT DSGB10_WORLD MATCHES "^[124]$")
+  message(FATAL_ERROR "DSGB10_WORLD=${DSGB10_WORLD}: the engine builds for world 1, 2 or 4 "
+                      "(3 does not divide the checkpoint's 129280 vocabulary rows, 5120 hidden, 64 heads "
+                      "or 1280 q-lora rows)")
+endif()
+add_compile_definitions(DSGB10_WORLD=${DSGB10_WORLD})
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()

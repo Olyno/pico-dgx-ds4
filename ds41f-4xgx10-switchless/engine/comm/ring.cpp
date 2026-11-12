@@ -1,4 +1,4 @@
-// Collectives for the four-box ring: bootstrap, RDMA setup and the proxy thread (see ring.h).
+// Collectives for the built world's ring: bootstrap, RDMA setup and the proxy thread (see ring.h).
 #include "comm/ring.h"
 
 #include <arpa/inet.h>
@@ -66,8 +66,9 @@ Layout make_layout(size_t cap) {
 // The relayed half of an n-byte contribution starts at h; [0, h) goes one way, [h, n) the other.
 inline uint32_t split_at(uint32_t n) { return (n / 2) & ~63u; }
 
-// Reduce-scatter: the opposite rank's quarter (q bytes) goes [0, h) through prev and [h, q) through
-// next, slow_pct percent of it on the path that crosses the slow link.
+// Reduce-scatter on the four-box ring: the opposite rank's part (q bytes) goes [0, h) through prev and
+// [h, q) through next, slow_pct percent of it on the path that crosses the slow link. Worlds 2 and 1
+// relay nothing, so nothing calls this there (the peer's part is written straight to it).
 inline uint32_t rs_split(int sender, uint32_t q, int slow_pct) {
   const uint32_t part = (uint32_t)((uint64_t)q * slow_pct / 100) & ~63u;
   // through next the path takes links sender and sender + 1 (link i joins ranks i and i + 1)
@@ -83,11 +84,12 @@ struct Seg {
 // What `sender`'s post of kind op (n bytes) sends to one neighbour: A, the part that neighbour
 // relays on to the sender's opposite rank (sent first, so the relay can start early), and B, the
 // rest. All-exchange: the whole contribution; next relays [h, n), prev relays [0, h).
-// Reduce-scatter: quarter k (q = n / 4 bytes) is for rank k; a neighbour gets its own quarter (B)
+// Reduce-scatter: part k (q = n / kRanks bytes) is for rank k; a neighbour gets its own part (B)
 // and relays its share of the opposite rank's (A, rs_split).
 void direct_segs(uint32_t op, int sender, bool to_next, uint32_t n, int slow_pct, Seg& a, Seg& b) {
   if (op == kOpReduceScatter) {
-    const uint32_t q = n / 4, hq = rs_split(sender, q, slow_pct), opp = (sender + 2) % kRanks * q;
+    const uint32_t q = n / kRanks, hq = rs_split(sender, q, slow_pct),
+                   opp = (sender + kRanks / 2) % kRanks * q;
     if (to_next) {
       a = {opp + hq, q - hq};
       b = {(sender + 1) % kRanks * q, q};
@@ -381,7 +383,7 @@ inline void io_fence() { asm volatile("dmb osh" ::: "memory"); }
 struct Ring::Impl {
   Options opt;
   const Fleet* F = nullptr;  // the fleet file (ring mode, or to find the rank)
-  int rank = 0, next = 0, prev = 0;
+  int rank = 0, next = 0, prev = 0, opp = 0;  // opp: (rank + kRanks / 2) % kRanks (this rank at world 2 and 1)
   Layout L;
   HostRegion region;
   uint8_t* base = nullptr;
@@ -389,6 +391,11 @@ struct Ring::Impl {
   Link to_opp[kDomains];  // direct mode only: straight to the opposite rank
   bool direct = false;
   bool merge = false;  // direct mode: a small contribution goes to a neighbour as one write and one flag pair
+  // Whether the proxy relays anything: only the four-box ring has an opposite rank that is neither this
+  // rank nor a neighbour. At world 2 the one peer is both neighbours and the opposite rank is this rank
+  // itself (its contribution is the send buffer, so the opp flags are set locally); at world 1 there is
+  // no peer at all and the ring runs in its loopback mode.
+  bool relay = false;
   int sock_next = -1, sock_prev = -1, sock_listen = -1;
   DevChannel dev{};
   unsigned long long* d_seq = nullptr;
@@ -427,14 +434,22 @@ int rank_from_hostname(const std::string& fleet_file) {
 Ring::Ring(const Options& o) : impl_(new Impl) {
   Impl& I = *impl_;
   I.opt = o;
-  const bool net = o.mode == Options::kRing;
+  // World 1 has no peer: every contribution is this rank's own, so the ring runs as its single-box
+  // loopback (the proxy answers each post by setting the wait flags) and no network is touched.
+  if (kRanks == 1 && I.opt.mode == Options::kRing) I.opt.mode = Options::kLoopProxy;
+  const bool net = I.opt.mode == Options::kRing;
   if (net) {
     const char* e = std::getenv("DSGB10_RING_DIRECT");
     const int v = o.direct >= 0 ? o.direct : (e ? atoi(e) : 0);
+    if (v && kRanks != 4)
+      die("comm: direct mode (--direct, DSGB10_RING_DIRECT) is the four-box ring's: at world %d %s", kRanks,
+          kRanks == 2 ? "the one peer is both neighbours and the opposite rank is this rank itself"
+                      : "there is no peer at all");
     I.direct = v != 0;
     I.merge = v >= 2;
   }
-  if (net || o.rank < 0) I.F = &fleet(o.fleet);
+  I.relay = kRanks == 4 && !I.direct;
+  if (net || I.opt.rank < 0) I.F = &fleet(o.fleet);
   if (o.rank >= kRanks) die("comm: rank %d, but the ring has %d", o.rank, kRanks);
   I.rank = o.rank >= 0 ? o.rank : rank_from_hostname(o.fleet);
   if (I.rank < 0) {
@@ -444,6 +459,7 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
   }
   I.next = (I.rank + 1) % kRanks;
   I.prev = (I.rank + kRanks - 1) % kRanks;
+  I.opp = (I.rank + kRanks / 2) % kRanks;
   CUDA_CHECK(cudaFree(nullptr));  // create the primary context the driver calls below use
   CU_CHECK(cuInit(0));
   I.L = make_layout(o.cap);
@@ -480,11 +496,14 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
   DevChannel& D = I.dev;
   D.rank = I.rank;
   D.cap = (uint32_t)I.L.cap;
+  // Each rank index gets the buffer its contribution arrives in; a rank that is its own neighbour (world
+  // 2: prev == next == the one peer) or the opposite rank (world 2 and 1) is wired once, in the order the
+  // proxy fills them: this rank's send buffer, the neighbour's, the relayed opposite rank's.
   for (int p = 0; p < kSlots; p++) {
     D.src[p][I.rank] = I.base + I.L.send[p];
-    D.src[p][I.prev] = I.base + I.L.from_prev[p];
-    D.src[p][I.next] = I.base + I.L.from_next[p];
-    D.src[p][(I.rank + 2) % kRanks] = I.base + I.L.opp[p];
+    if (I.prev != I.rank) D.src[p][I.prev] = I.base + I.L.from_prev[p];
+    if (I.next != I.rank && I.next != I.prev) D.src[p][I.next] = I.base + I.L.from_next[p];
+    if (I.opp != I.rank && I.opp != I.prev && I.opp != I.next) D.src[p][I.opp] = I.base + I.L.opp[p];
     D.wait[p][kWaitPrevA] = I.flag(p, kFromPrevA);
     D.wait[p][kWaitPrevB] = I.flag(p, kFromPrevB);
     D.wait[p][kWaitNextA] = I.flag(p, kFromNextA);
@@ -500,7 +519,7 @@ Ring::Ring(const Options& o) : impl_(new Impl) {
 
   I.tr.assign(o.trace > 0 ? o.trace + 2 : 0, TraceRec{});
   barrier();  // every QP is ready to receive before anyone sends
-  if (o.mode != Options::kLoopNone) I.proxy = std::thread([&I] {
+  if (I.opt.mode != Options::kLoopNone) I.proxy = std::thread([&I] {
     if (I.opt.proxy_cpu >= 0) {
       cpu_set_t cs;
       CPU_ZERO(&cs);
@@ -763,9 +782,12 @@ void Ring::Impl::post_direct(uint64_t seq, uint32_t n, uint32_t op) {
   for (Side& sd : sides) {
     Seg a, b;
     direct_segs(op, rank, sd.to_next, n, opt.rs_slow_pct, a, b);
-    // Direct mode: nobody relays. An all-exchange still sends each neighbour all of it (A and B); a
-    // reduce-scatter sends a neighbour only its own quarter (B), with A's flag for the waiters.
-    if (direct && op == kOpReduceScatter) a.len = 0;
+    // Nobody relays in direct mode or at world 2. An all-exchange still sends each neighbour all of it
+    // (A and B); a reduce-scatter sends a neighbour only its own part (B), with A's flag for the waiters.
+    if (!relay && op == kOpReduceScatter) a.len = 0;
+    // World 2: the one peer is both neighbours, and the device side reads its contribution from the
+    // from_prev buffer alone (the DevChannel wiring), so the other side only carries the flags.
+    if (kRanks == 2 && !sd.to_next) a.len = b.len = 0;
     static_assert(kFromPrevB == kFromPrevA + 1 && kFromNextB == kFromNextA + 1, "the A and B flags must be neighbours");
     if (direct && merge && !split) {
       // nobody relays, so A need not go first: the neighbour's bytes in one write, both flags in one
@@ -792,6 +814,16 @@ void Ring::Impl::post_direct(uint64_t seq, uint32_t n, uint32_t op) {
     }
   }
   if (direct) post_opp(seq, n, op);
+  if (!relay && kRanks != 4) {
+    // No opposite rank: its contribution is this rank's own send buffer, written before the post. The
+    // device side still waits on the two opp flags (wait_all's fixed set), so the proxy sets them here.
+    for (int k : {kOpp0, kOpp1}) {
+      Flag* f = flag(p, k);
+      f->nbytes = n;
+      f->op = op;
+      __atomic_store_n(&f->seq, seq, __ATOMIC_RELEASE);
+    }
+  }
   st.posted++;
 }
 
@@ -804,8 +836,8 @@ void Ring::Impl::post_opp(uint64_t seq, uint32_t n, uint32_t op) {
   const uint8_t* mine = base + L.send[p];
   uint32_t off = 0, len = n;
   if (op == kOpReduceScatter) {
-    len = n / 4;
-    off = (rank + 2) % kRanks * len;
+    len = n / kRanks;
+    off = opp * len;
   }
   static_assert(kOpp1 == kOpp0 + 1, "the opp flags must be neighbours");
   if (n < opt.split_domains_from) {
@@ -889,7 +921,7 @@ void Ring::Impl::proxy_loop() {
         worked = true;
       }
     }
-    if (!direct) {
+    if (relay) {
       Flag* f = flag(next_relay_prev % kSlots, kFromNextA);
       if (load_acquire(&f->seq) == next_relay_prev) {
         if (done_relay_next + 1 >= next_relay_prev) {
@@ -904,7 +936,7 @@ void Ring::Impl::proxy_loop() {
         }
       }
     }
-    if (!direct) {
+    if (relay) {
       Flag* f = flag(next_relay_next % kSlots, kFromPrevA);
       if (load_acquire(&f->seq) == next_relay_next) {
         if (done_relay_prev + 1 >= next_relay_next) {
