@@ -28,7 +28,7 @@ log() { echo "[stop.sh] $*"; }
 warn() { echo "[stop.sh] WARN: $*" >&2; }
 
 exists() { docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; }
-running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" && exists ]; }
+running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ] && exists; }
 
 if ! exists; then
   log "No container named $CONTAINER: nothing to stop"
