@@ -9,8 +9,13 @@
 #   ./start.sh restart         stop, then start
 #   ./start.sh status          exit 0 serving, 1 not
 #   ./start.sh fleet           write the fleet file from TP + WORKERS (fleet/gen-fleet.sh)
-#   ./start.sh prepare         one-time on rank 0: download the checkpoint if missing, then
-#                              cut each rank's .dsw and its Engram shards (--no-download skips the fetch)
+#   ./start.sh prepare [ARGS]  one-time on rank 0: the checkpoint (downloaded or repaired
+#                              only when it is not already complete), then every rank's .dsw
+#                              and its Engram shards. ARGS go to dsw-prepare: --consume
+#                              releases the checkpoint's blocks as the outputs land,
+#                              --source http streams it instead of storing it, --replace
+#                              skips the "delete these?" prompt, --dest R=DIR writes a rank
+#                              straight to a mounted path
 #   ./start.sh --help
 #   DRY_RUN=1 ./start.sh       print the docker command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
@@ -72,114 +77,39 @@ ensure_image() {
   }
 }
 
-# One-time setup on rank 0: the checkpoint (if missing), then each rank's .dsw and
-# its Engram shards, all with the image's own binaries. Serving needs those
-# artefacts and a tokenizer.json, not the checkpoint itself.
+# One-time setup on rank 0: the checkpoint (downloaded or repaired when it is not
+# already complete), then every rank's .dsw and its Engram shards, by dsw-prepare
+# inside the image. Serving needs those artefacts, a tokenizer and the hash map,
+# not the checkpoint itself. Extra arguments go to dsw-prepare: --consume releases
+# the checkpoint's blocks as the outputs land, --source http streams it instead of
+# storing it, --replace skips the "delete these?" prompt, --dest R=DIR writes a
+# rank straight to a mounted path.
 prepare() {
-  local ckpt=${CKPT:-$HOME/DeepSeek-V4.1-Flash-1017}
-  local out=${PREPARE_OUT:-$HOME/dsgb10/convert}
-  local repo=${HF_REPO:-deepseek-ai/DeepSeek-V4.1-Flash-1017} rev=${HF_REV:-1bae0e10}
-  local nodl=0 a r
-  for a in "$@"; do
-    case $a in
-      --no-download) nodl=1 ;;
-      *) die "prepare: unknown argument $a" ;;
-    esac
-  done
-  for a in "$ckpt" "$out"; do
-    case "$a" in
-      "$HOME"/*|/data/*) ;;
-      *) die "keep CKPT and PREPARE_OUT under \$HOME or /data (the container mounts only those): $a" ;;
-    esac
-  done
-  [ "$DRY" = "1" ] || [ -e /dev/nvidia0 ] ||
-    die "prepare needs the GB10 GPU (dsw_convert tiles on it): run it on rank 0, the head"
-  local ckpt_in out_in
-  ckpt_in=$(in_container "$ckpt") out_in=$(in_container "$out")
-
-  # The checkpoint's shards are Xet-backed and refuse the classic path ("the file
-  # is too large to be downloaded using the regular download method"), so xet
-  # stays on: its "Background writer channel closed" was a full disk, not xet.
-  # HF_NO_XET=1 forces the classic path (small repos only).
-  local xetarg=()
-  [ -n "${HF_NO_XET:-}" ] && xetarg=(-e HF_HUB_DISABLE_XET=1)
+  local out="$HOME/dsgb10/convert"
+  local envarg=()
   # docker run inherits none of this shell's environment: a proxy or a mirror
   # endpoint set here would be lost and the download would hang at 0 %.
-  local envarg=()
   for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy \
     HF_ENDPOINT HF_TOKEN HF_DEBUG HF_HUB_ETAG_TIMEOUT; do
     [ -n "${!v:-}" ] && envarg+=(-e "$v")
   done
-  prep_exec() {  # what; shell in the image
-    log "$1"
-    [ "$DRY" = "1" ] && { echo "    $2"; return 0; }
-    docker run --rm --gpus all --ipc=host --network host -v "$HOME:/root" -v /data:/data \
-      "${xetarg[@]}" "${envarg[@]}" \
-      "$IMAGE" bash -lc "cd /work/ds41f-4xgx10-switchless && $2" ||
-      die "prepare: '$1' failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
+  # The shards are Xet-backed and the classic path refuses files this large.
+  [ -n "${HF_NO_XET:-}" ] && envarg+=(-e HF_HUB_DISABLE_XET=1)
+  # The prompt that asks before deleting existing outputs needs a terminal.
+  local ttyarg=()
+  [ -t 0 ] && ttyarg=(-it)
+
+  log "prepare: checkpoint (only if not already complete), then $TP rank file(s) and Engram shards into $out"
+  [ "$DRY" = "1" ] && {
+    echo "    docker run --rm ${ttyarg[*]} --ipc=host --network host -v $HOME:/root -v /data:/data \\"
+    echo "      $IMAGE prepare/target/release/dsw-prepare prepare --world $TP $*"
+    return 0
   }
-
-  # Space, before anything long: the checkpoint (~510 GB, once) plus each rank's
-  # file and Engram shards (~130 GB a rank: 78 + 51) under PREPARE_OUT.
-  space_ok() {  # path need_gb what
-    local d=$1 free
-    while [ ! -d "$d" ] && [ "$d" != / ]; do d=$(dirname "$d"); done
-    free=$(df -Pk "$d" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
-    [ "${free:-0}" -ge "$2" ] && return 0
-    local msg="only ${free:-?} GiB free on $d; $3 needs ~$2 GiB"
-    [ "$DRY" = "1" ] && { warn "DRY_RUN: $msg"; return 0; }
-    die "$msg
-  the checkpoint and this staging are separate allocations: a complete checkpoint does not
-  count towards it. Free ~$(( $2 - ${free:-0} )) GiB more, or put the staging on another
-  mount with PREPARE_OUT=/data/dsgb10/convert (/data is mounted in the container), or cut one
-  rank at a time and move each file off before the next (OUT_GB=$per_rank_gb at TP=$TP)."
-  }
-  local need_ckpt=0
-  [ -f "$ckpt/config.json" ] || need_ckpt=${NEED_GB:-520}
-  # A rank file is the checkpoint cut TP ways: 78 GB at TP=4, so ~312/TP. The Engram
-  # shards are the kit's fixed 4-way row split, 50.7 GB a rank whatever TP is.
-  local per_rank_gb=$(((312 + TP - 1) / TP + 52))
-  space_ok "$ckpt" "$need_ckpt" "the checkpoint"
-  space_ok "$out" $((TP * ${OUT_GB:-$per_rank_gb})) "the rank files and Engram shards (TP=$TP)"
-
-  if [ "$nodl" = 1 ]; then
-    log "prepare: --no-download, using $ckpt"
-  else
-    if [ -f "$ckpt/config.json" ]; then
-      # A download that ran out of space leaves config.json behind and shards short: the
-      # converter then fails on a tensor count. hf download is idempotent and resumes.
-      log "prepare: checkpoint present at $ckpt: re-checking it (hf download repairs a partial one)"
-    fi
-    # hf (huggingface_hub >= 0.27) or the older CLI, chosen once: a `||` chain
-    # would mask a failed download as "command not found".
-    prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable)" \
-      "if command -v hf >/dev/null 2>&1; then hf download $repo --revision $rev --local-dir $ckpt_in; else huggingface-cli download $repo --revision $rev --local-dir $ckpt_in; fi"
-  fi
-  # dsw_convert statvfs()es the output's directory before writing, and engram_pack
-  # writes into $out/engram: both must exist (the container sees the same paths).
-  [ "$DRY" = "1" ] || mkdir -p "$out/engram" || die "cannot create $out"
-  for ((r = 0; r < TP; r++)); do
-    prep_exec "cut rank $r of $TP" \
-      "engine/build/weights/dsw_convert --ckpt $ckpt_in --rank $r --world $TP --out $out_in/rank$r.dsw"
-    prep_exec "verify rank $r" \
-      "engine/build/weights/dsw_verify --ckpt $ckpt_in --file $out_in/rank$r.dsw --threads 4"
-  done
-  for ((r = 0; r < TP; r++)); do
-    prep_exec "pack rank $r's Engram shards" \
-      "engine/build/engram/engram_pack $ckpt_in $out_in/engram $r"
-  done
-  prep_exec "write the Engram hash map" \
-    "python3 engine/engram/py/make_hashmap_stdlib.py $ckpt_in $out_in/engram/engram_hashmap.bin"
-
-  log "done: rank files and engram/ under $out"
-  log "install rank 0's files where the fleet file says, then copy the rest:"
-  echo "    cp $out/rank0.dsw <RANK0_WEIGHTS>; cp -r $out/engram/* <RANK0_ENGRAM>/; cp $out/engram/engram_hashmap.bin <RANK0_HASHMAP>"
-  for ((r = 1; r < TP; r++)); do
-    echo "    rsync -h --progress $out/rank$r.dsw <RANK${r}_SSH>:<RANK${r}_WEIGHTS>"
-    echo "    rsync -h --progress $out/engram/engram-l*-r${r}of4.bin <RANK${r}_SSH>:<RANK${r}_ENGRAM>/"
-    echo "    rsync -h --progress $out/engram/engram_hashmap.bin <RANK${r}_SSH>:<RANK${r}_HASHMAP>"
-  done
-  log "then: ./start.sh"
+  mkdir -p "$out"
+  docker run --rm "${ttyarg[@]}" --ipc=host --network host -v "$HOME:/root" -v /data:/data \
+    -w /work/ds41f-4xgx10-switchless "${envarg[@]}" \
+    "$IMAGE" prepare/target/release/dsw-prepare prepare --world "$TP" "$@" ||
+    die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
 }
 
 MODE=start
@@ -253,18 +183,18 @@ if [ ! -f "$CF" ]; then
       log "deployed the confidence-gate weights to $CF"
   fi
 fi
-# Serving needs the tokenizer, not the 510 GB checkpoint: the rank files and the
-# Engram shards are cut from the checkpoint once (`./start.sh prepare`).
+# Serving needs the tokenizer, not the 510 GB checkpoint: `./start.sh prepare`
+# copies it beside the rank files, so it survives the checkpoint's deletion.
 TOKENIZER="${TOKENIZER:-}"
 if [ -z "$TOKENIZER" ]; then
-  for c in "${CKPT:+$CKPT/tokenizer.json}" "$HOME/DeepSeek-V4.1-Flash/tokenizer.json" \
-    "$HOME/DeepSeek-V4.1-Flash-1017/tokenizer.json" /data/models/DeepSeek-V4.1-Flash/tokenizer.json; do
-    if [ -n "$c" ] && [ -f "$c" ]; then TOKENIZER=$c && break; fi
+  for c in "$HOME/dsgb10/convert/tokenizer.json" "$HOME/DeepSeek-V4.1-Flash-1017/tokenizer.json" \
+    "$HOME/DeepSeek-V4.1-Flash/tokenizer.json" /data/models/DeepSeek-V4.1-Flash/tokenizer.json; do
+    if [ -f "$c" ]; then TOKENIZER=$c && break; fi
   done
 fi
 if [ -z "$TOKENIZER" ]; then
-  [ "$DRY" = "1" ] && warn "DRY_RUN: no tokenizer.json found under CKPT or ~/DeepSeek-V4.1-Flash*" ||
-    die "no tokenizer.json found: set CKPT to a checkpoint dir (or TOKENIZER=FILE); ./start.sh prepare downloads one"
+  [ "$DRY" = "1" ] && warn "DRY_RUN: no tokenizer.json found (run ./start.sh prepare, or set TOKENIZER=FILE)" ||
+    die "no tokenizer.json found: run ./start.sh prepare, or set TOKENIZER=FILE"
 fi
 
 # ---------------------------------------------------------------- 3. previous

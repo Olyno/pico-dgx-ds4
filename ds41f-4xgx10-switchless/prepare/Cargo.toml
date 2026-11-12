@@ -1,0 +1,24 @@
+[package]
+name = "dsw-prepare"
+version = "0.1.0"
+edition = "2021"
+description = "Cut the DeepSeek-V4.1-Flash checkpoint into per-rank .dsw files and Engram shards under a bounded disk budget: streaming source reader, durable journal, dependency-aware reclamation"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "dsw-prepare"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 3
+debug = 1
+codegen-units = 4
+lto = "thin"

@@ -31,9 +31,11 @@ WORKDIR /work
 COPY ds41f-4xgx10-switchless/fleet/ ds41f-4xgx10-switchless/fleet/
 COPY ds41f-4xgx10-switchless/engine/ ds41f-4xgx10-switchless/engine/
 COPY ds41f-4xgx10-switchless/frontend/ ds41f-4xgx10-switchless/frontend/
+COPY ds41f-4xgx10-switchless/prepare/ ds41f-4xgx10-switchless/prepare/
 RUN cmake -S ds41f-4xgx10-switchless/engine -B ds41f-4xgx10-switchless/engine/build \
  && cmake --build ds41f-4xgx10-switchless/engine/build -j4 \
- && (cd ds41f-4xgx10-switchless/frontend && cargo build --release -j4)
+ && (cd ds41f-4xgx10-switchless/frontend && cargo build --release -j4) \
+ && cargo build --release -j4 --manifest-path ds41f-4xgx10-switchless/prepare/Cargo.toml
 
 # service.sh start/stop/status is the entry point (see start.sh).
 WORKDIR /work/ds41f-4xgx10-switchless

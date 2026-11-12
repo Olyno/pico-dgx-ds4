@@ -119,3 +119,19 @@ Measured and not built:
   166 held-out sequences did not close the gap (chat accepted length 1.463 -> 1.464, FP8 1.493); a full fine-tune was not run.
 
 The chat target of 100 tok/s on the 320 held prompts was not reached: 90.3.
+
+## prepare: conversion under a bounded disk, in Rust (2026-11-12)
+
+`./start.sh prepare` no longer stages the whole checkpoint and every output on one disk. The work moved to
+`ds41f-4xgx10-switchless/prepare` (`dsw-prepare`), CPU only, so it does not need the GPU:
+
+| # | Change | Files | Default | Same bytes | Before -> after |
+|---|---|---|---|---|---|
+| 17 | Streaming conversion: the checkpoint is downloaded only when it is missing or a shard is short; batches read one source tensor, write every rank's slice, read it back, un-tile it with the inverse mapping, compare, `fsync`, journal, and only then release the source blocks (`--consume`). Sources are local files (hole punching) or HTTP ranges (`--source http`), outputs go to the staging directory or per-rank destinations (`--dest R=DIR`) | `prepare/src/{dsw,safetensors,plan,tile,convert,journal,space,source,engram}.rs`, `start.sh`, `Dockerfile`, `.env.example` | on | yes: every tensor compared with the checkpoint | peak disk for TP=4: 1026 GB (checkpoint + all ranks staged) -> 129 GB a rank, 514 GB if all four share one disk, 129 GB + one shard when streamed; the checkpoint can be released as the outputs land |
+| - | Removed the `CKPT`, `PREPARE_OUT`, `HF_REPO`, `HF_REV`, `NEED_GB` and `OUT_GB` variables: the locations have defaults and the space needed is computed from the plan | `.env.example`, `start.sh` | - | - | six knobs fewer |
+
+The partition plan is a port of `engine/weights/plan.cpp`; on a synthetic checkpoint covering every rule it prints
+byte-identical plans for all four ranks, and the tiling is a third implementation of `layout.h` (the kernels' `tile_fp8`
+/ `tile_fp4` write, `layout.h` and this crate un-tile, and the round trip is tested). Tests: 37 unit
+(format, permutations, rules, journal replay, punching, HTTP ranges) and 7 end-to-end (four ranks plus Engram verified
+against the checkpoint, crash-then-resume, release-and-compare, tamper detection, overwrite refusal).

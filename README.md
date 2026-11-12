@@ -148,12 +148,12 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 **In a container (one command).** `./start.sh` builds the image from [Dockerfile](Dockerfile) (engine + front-end,
 `sm_121a`), starts `engine/server/service.sh` inside a host-networked GPU container and waits until the API answers;
 `./stop.sh` stops it and frees the GPU. Settings come from `.env` (see [.env.example](.env.example)): `TP`, `FLEET`,
-`CKPT`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`.
+`WORKERS`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`.
 
 ```bash
-cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, CKPT, port
+cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, port
 ./start.sh fleet                         # write the fleet file from TP + WORKERS (no hand-editing)
-./start.sh prepare                       # once, rank 0: checkpoint download + rank files + Engram shards
+./start.sh prepare                       # once, rank 0: checkpoint (if missing) + rank files + Engram shards
 ./start.sh                               # docker build + service start + smoke test
 ./start.sh status                        # exit 0 while serving
 ./stop.sh                                # graceful stop, then remove the container
@@ -163,10 +163,31 @@ cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, CKPT, port
 `WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs. The API key
 is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
 
-`./start.sh prepare` is the one-time setup on rank 0: it downloads the checkpoint (unless `CKPT/config.json` is
-already there), cuts each rank's `.dsw` with `dsw_convert --world $TP`, verifies it, packs the Engram shards and writes
-the hash map, then prints the copy commands for the worker boxes. `start` needs those artefacts plus a
-`tokenizer.json` — not the checkpoint — so it never downloads anything by itself.
+`./start.sh prepare` is the one-time setup on rank 0, run by `dsw-prepare`
+(`ds41f-4xgx10-switchless/prepare`, Rust, CPU only — it does not need the GPU). It looks for the checkpoint at
+`~/DeepSeek-V4.1-Flash-1017` and downloads it **only** when it is missing or a shard is short, then cuts every rank's
+`.dsw` and its Engram shards into `~/dsgb10/convert`, verifies every tensor against the checkpoint, writes the hash map
+and copies the `tokenizer.json` beside the artefacts. `start` needs those artefacts plus that tokenizer — not the
+checkpoint — so it never downloads anything by itself.
+
+Outputs an earlier run left behind are never overwritten silently: `prepare` lists them and asks on the terminal
+(`--replace` answers for a script); answering no stops the run. The space it needs is computed from the plan, not from
+an environment variable, and it refuses to start when the filesystem cannot hold the outputs plus headroom.
+
+Extra arguments go to `dsw-prepare`:
+
+| argument | what it does |
+|---|---|
+| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run |
+| `--source http` | streams the checkpoint through HTTP ranges instead of storing it (only the batch in flight is on disk) |
+| `--dest R=DIR` | writes rank R straight into a mounted directory (a worker's disk over NFS), instead of staging and copying |
+| `--replace` | skips the "delete these outputs?" prompt |
+| `--no-verify` | skips the read-back comparison (faster, and it removes the guarantee) |
+
+Every batch is journaled (`rank<r>.dsw.journal`) after its outputs are written, verified and synced, so an interrupted
+run resumes where it stopped and a crash cannot leave a tensor committed but unreadable. `dsw-prepare status --out DIR`
+prints each rank's progress, and `dsw-prepare verify --ckpt DIR --file FILE` re-derives every tensor from the TOC's own
+description and compares it with the checkpoint.
 
 The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
 work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.
@@ -174,7 +195,7 @@ work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fle
 need the same CUDA driver and `rdma-core` (a container on rank 0 only is not enough).
 
 **Tensor parallelism.** `TP` (env, default 4) is the degree the scripts use: the fleet needs `RANK1..RANK{TP-1}_SSH`,
-and `dsw_convert --world $TP` cuts matching rank files. The engine's kernels and ring are specialised to TP=4, so
+and `dsw-prepare --world $TP` cuts matching rank files. The engine's kernels and ring are specialised to TP=4, so
 `dsgb10_rank` refuses any other value with a message naming the fix (`engine/common/tp.h`) instead of computing
 garbage; the per-rank shapes all derive from `model::kRanks` (`engine/model/config.h`), which is the one place a
 generalisation starts.
@@ -189,6 +210,7 @@ This is the exact build behind the numbers above (the engine source in this repo
                         cd ds41f-4xgx10-switchless
                         cmake -S engine -B engine/build && cmake --build engine/build -j4
                         (cd frontend && cargo build --release -j4)
+                        cargo build --release --manifest-path prepare/Cargo.toml
   3  gate weights ... copy ds41f-4xgx10-switchless/tools/stack4/cfmlp_cml.bin to the SAME path on
                       all four boxes (e.g. ~/cfmlp_cml.bin). The engine exits at start without it.
   4  engine args .... the block below, through service.sh
