@@ -151,16 +151,21 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 `CKPT`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`.
 
 ```bash
-cp .env.example .env && $EDITOR .env     # TP=4, FLEET, CKPT, port
+cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, CKPT, port
+./start.sh fleet                         # write the fleet file from TP + WORKERS (no hand-editing)
 ./start.sh                               # docker build + service start + smoke test
 ./start.sh status                        # exit 0 while serving
 ./stop.sh                                # graceful stop, then remove the container
 ```
 
+`./start.sh fleet` derives the rank count, per-rank paths and the ring's link addresses from `TP` and
+`WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs. The API key
+is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
+
 The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
 work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.
-`service.sh` still copies the engine binary to ranks 1–3 over ssh, so those boxes need the same CUDA driver and
-`rdma-core` (a container on rank 0 only is not enough).
+`service.sh` still copies the engine binary and the confidence-gate weights to ranks 1..TP−1 over ssh, so those boxes
+need the same CUDA driver and `rdma-core` (a container on rank 0 only is not enough).
 
 **Tensor parallelism.** `TP` (env, default 4) is the degree the scripts use: the fleet needs `RANK1..RANK{TP-1}_SSH`,
 and `dsw_convert --world $TP` cuts matching rank files. The engine's kernels and ring are specialised to TP=4, so

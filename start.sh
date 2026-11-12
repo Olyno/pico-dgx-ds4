@@ -8,8 +8,10 @@
 #   ./start.sh                 start (no-op if already serving)
 #   ./start.sh restart         stop, then start
 #   ./start.sh status          exit 0 serving, 1 not
+#   ./start.sh fleet           write the fleet file from TP + WORKERS (fleet/gen-fleet.sh)
 #   ./start.sh --help
 #   DRY_RUN=1 ./start.sh       print the docker command, change nothing
+#   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
 #
 # TP is the tensor-parallel degree (ranks 0..TP-1). The engine's kernels and
 # ring are TP=4 specialised: dsw_convert can cut --world N files, but
@@ -31,11 +33,13 @@ export TP="${TP:-${DSGB10_TP:-4}}"
 export DSGB10_TP="$TP"
 IMAGE="${IMAGE:-pico-dgx-ds4:latest}"
 CONTAINER="${CONTAINER_NAME:-pico-dgx-ds4}"
-FLEET="${FLEET:-$REPO/ds41f-4xgx10-switchless/fleet/homelab.conf}"
+FLEET_ENV="${FLEET:-}"  # what the user named, before the repo default
+FLEET="${FLEET_ENV:-$REPO/ds41f-4xgx10-switchless/fleet/homelab.conf}"
 PORT="${DSGB10_PORT:-18893}"
 ADDR="${DSGB10_ADDR:-127.0.0.1}"
 KEY="${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}"
 CF="${DSGB10_CF_MLP:-$HOME/cfmlp_cml.bin}"
+NO_AUTH="${DSGB10_NO_AUTH:-0}"
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 DRY="${DRY_RUN:-0}"
 
@@ -54,7 +58,7 @@ in_container() {
 
 MODE=start
 case "${1:-}" in
-  start | restart | status) MODE=$1; shift ;;
+  start | restart | status | fleet) MODE=$1; shift ;;
   -h | --help | help) usage; exit 0 ;;
 esac
 for arg in "$@"; do
@@ -62,7 +66,14 @@ for arg in "$@"; do
 done
 
 [[ "$TP" =~ ^[1-9][0-9]*$ ]] || die "TP='$TP' is not a positive integer (tensor-parallel degree)"
-[ -f "$FLEET" ] || die "fleet file $FLEET not found (set FLEET=FILE; copy ds41f-4xgx10-switchless/fleet/homelab.conf)"
+
+# ./start.sh fleet: write the fleet file from TP + WORKERS instead of hand-editing it.
+if [ "$MODE" = "fleet" ]; then
+  exec "$REPO/ds41f-4xgx10-switchless/fleet/gen-fleet.sh" \
+    --out "${FLEET_ENV:-$REPO/fleet.conf}" "$@"
+fi
+
+[ -f "$FLEET" ] || die "fleet file $FLEET not found (./start.sh fleet generates one from TP and WORKERS, or set FLEET=FILE)"
 for ((r = 1; r < TP; r++)); do
   grep -q "^RANK${r}_SSH=" "$FLEET" || die "fleet file $FLEET has no RANK${r}_SSH (TP=$TP needs ranks 0..$((TP - 1)))"
 done
@@ -93,7 +104,9 @@ docker image inspect "$IMAGE" >/dev/null 2>&1 || {
 }
 
 # ---------------------------------------------------------------- 2. files
-if [ ! -r "$KEY" ]; then
+if [ "$NO_AUTH" = "1" ]; then
+  log "DSGB10_NO_AUTH=1: serving without a bearer key (only safe on loopback or a trusted network)"
+elif [ ! -r "$KEY" ]; then
   if [ "$DRY" = "1" ]; then
     log "DRY_RUN: would create the API key file $KEY"
   else
@@ -161,9 +174,11 @@ run_args=(
   -e "TP=$TP" -e "DSGB10_TP=$TP" -e FLEET=/root/fleet.conf
   -e "DSGB10_PORT=$PORT" -e "DSGB10_ADDR=$ADDR"
   -e "DSGB10_KEY_FILE=$(in_container "$KEY")"
+  -e "DSGB10_CF_MLP=$(in_container "$CF")"  # service.sh copies it to every worker
   -e "DSGB10_ENGINE_ARGS=$EARGS"
   -e "DSGB10_FRONT_ARGS=$FARGS"
 )
+[ "$NO_AUTH" = "1" ] && run_args+=(-e DSGB10_NO_AUTH=1)
 cmd=(docker run)
 [ "${FOREGROUND:-0}" = "1" ] || cmd+=(-d)
 cmd+=("${run_args[@]}" "$IMAGE" bash -c 'engine/server/service.sh start && sleep infinity')
@@ -186,12 +201,11 @@ until curl -s --max-time 5 "http://127.0.0.1:$PORT/health" | grep -qx ok; do
   fi
   sleep 5
 done
-if [ -r "$KEY" ]; then
-  code=$(curl -s -o /tmp/pico-ds4-smoke.json -w '%{http_code}' --max-time 120 \
-    "http://127.0.0.1:$PORT/v1/chat/completions" \
-    -H "Authorization: Bearer $(cat "$KEY")" -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20}') || code=000
-  [ "$code" = "200" ] || { cat /tmp/pico-ds4-smoke.json >&2; die "smoke test failed (HTTP $code)"; }
-fi
+auth=()
+[ "$NO_AUTH" = "1" ] || auth=(-H "Authorization: Bearer $(cat "$KEY")")
+code=$(curl -s -o /tmp/pico-ds4-smoke.json -w '%{http_code}' --max-time 120 \
+  "http://127.0.0.1:$PORT/v1/chat/completions" "${auth[@]}" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Reply with one word: pong"}],"max_tokens":20}') || code=000
+[ "$code" = "200" ] || { cat /tmp/pico-ds4-smoke.json >&2; die "smoke test failed (HTTP $code)"; }
 log "DeepSeek-V4.1-Flash is now LIVE on http://127.0.0.1:$PORT/v1 (model deepseek-v4.1-flash)"
 log "logs: docker logs -f $CONTAINER"
