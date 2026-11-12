@@ -3,8 +3,11 @@
 # from the tensor-parallel degree and the ssh targets, so the mechanical part —
 # TP ranks, per-rank paths, link addresses — is not hand-typed.
 #
-#   TP=4 WORKERS="u@spark1 u@spark2 u@spark3" fleet/gen-fleet.sh --out ~/fleet.conf
-#   TP=2 WORKERS="u@spark1"                    fleet/gen-fleet.sh --print
+#   WORKERS="u@spark1 u@spark2 u@spark3" fleet/gen-fleet.sh --out ~/fleet.conf   # 4 ranks
+#   WORKERS="u@spark1"                   fleet/gen-fleet.sh --print              # 2 ranks
+#
+# The rank count is the list plus the head; TP in the environment (or DSGB10_TP)
+# is only cross-checked against it, so two sources cannot disagree silently.
 #
 # What stays an input because it is a physical fact of the cabling: the RDMA
 # device names (the same on every box) and GID_INDEX. The link addresses follow
@@ -66,7 +69,7 @@ fi
 # TP=2 takes one target (WORKER= is the same thing, as in MiaAI's recipe).
 read -r -a W <<< "${WORKERS:-${WORKER:-}}"
 [ "${#W[@]}" -eq $((TP - 1)) ] ||
-  die "WORKERS needs $((TP - 1)) ssh target(s) for TP=$TP (rank 0 is the head, local; ranks 1..$((TP - 1)) are remote), got ${#W[@]}: WORKERS=\"user@host ...\""
+  die "TP=$TP needs $((TP - 1)) ssh target(s) and WORKERS lists ${#W[@]}: the rank count follows WORKERS now, so drop TP, or list the other $((TP - 1)) target(s) (rank 0 is the head, local)"
 
 # A value from the environment if set, else the generated one.
 pick() { local v="RANK$1_$2"; printf '%s' "${!v:-$3}"; }

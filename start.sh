@@ -29,9 +29,11 @@
 #   DRY_RUN=1 ./start.sh       print the docker command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
 #
-# TP is the tensor-parallel degree (ranks 0..TP-1). The engine's kernels and
-# ring are TP=4 specialised: dsw_convert can cut --world N files, but
-# dsgb10_rank refuses TP != 4 (engine/common/tp.h) rather than compute garbage.
+# The rank count is not a setting: rank 0 is the head and every ssh target in
+# WORKERS is one more rank, so WORKERS="u@a u@b u@c" is a four-rank ring, and a
+# generated fleet file names exactly the same ranks. The engine's kernels and ring
+# are TP=4 specialised: prepare cuts --world N files and ./start.sh reshard re-cuts
+# an existing set, but dsgb10_rank refuses TP != 4 (engine/common/tp.h).
 set -euo pipefail
 cd "$(dirname "$0")"
 REPO="$(pwd)"
@@ -44,17 +46,6 @@ if [ -f "$ENV_FILE" ]; then
   set +a
   echo "[start.sh] loaded env from $ENV_FILE"
 fi
-
-# TP is the tensor-parallel degree, and the fleet is the head plus one box per
-# ssh target, so WORKERS may state it instead: TP = 1 + the targets. An explicit
-# TP (or DSGB10_TP) still wins, and with neither, the engine's own world, 4.
-if [ -z "${TP:-}" ] && [ -z "${DSGB10_TP:-}" ] && [ -n "${WORKERS:-${WORKER:-}}" ]; then
-  read -r -a _workers <<< "${WORKERS:-${WORKER:-}}"
-  TP=$((${#_workers[@]} + 1))
-  echo "[start.sh] TP=$TP from WORKERS (${#_workers[@]} ssh target(s) plus the head)"
-fi
-export TP="${TP:-${DSGB10_TP:-4}}"
-export DSGB10_TP="$TP"
 IMAGE="${IMAGE:-pico-dgx-ds4:latest}"
 CONTAINER="${CONTAINER_NAME:-pico-dgx-ds4}"
 FLEET_ENV="${FLEET:-}"  # what the user named, before the repo default
@@ -64,6 +55,7 @@ ADDR="${DSGB10_ADDR:-127.0.0.1}"
 KEY="${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}"
 CF="${DSGB10_CF_MLP:-$HOME/cfmlp_cml.bin}"
 NO_AUTH="${DSGB10_NO_AUTH:-0}"
+
 # VISION=1 keeps the image encoder's slice of the checkpoint (prepare --vision) and
 # points dsfront at it; VISION_IMAGE is the torch/PIL image that runs the encoder.
 VISION="${VISION:-0}"
@@ -76,6 +68,27 @@ die() { echo "[start.sh] ERROR: $*" >&2; exit 1; }
 warn() { echo "[start.sh] WARN: $*" >&2; }
 log() { echo "[start.sh] $*"; }
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+
+# ------------------------------------------------------------- rank count (TP)
+# TP is derived, never typed: rank 0 is the head (local) and each further rank is
+# one more box, so the list you already maintain states it —
+#   WORKERS="u@a u@b u@c"  ->  4 ranks, and ./start.sh fleet writes RANK1..3
+# — and a fleet file names exactly the same ranks. With neither, the engine's own
+# world, 4, is the only split that runs today.
+read -r -a _WORKERS <<< "${WORKERS:-${WORKER:-}}"
+derived_tp=0
+if [ "${#_WORKERS[@]}" -gt 0 ]; then
+  derived_tp=$((${#_WORKERS[@]} + 1))
+elif [ -f "$FLEET" ]; then
+  last=$(grep -oE '^RANK[0-9]+_SSH=' "$FLEET" | grep -oE '[0-9]+' | sort -n | tail -1 || true)
+  [ -n "${last:-}" ] && derived_tp=$((last + 1))
+fi
+[ "$derived_tp" -gt 0 ] || derived_tp=4
+# A TP left in an old .env is a second source of truth, so it is checked, not obeyed.
+explicit_tp="${TP:-${DSGB10_TP:-}}"
+[ -z "$explicit_tp" ] || [ "$explicit_tp" = "$derived_tp" ] ||
+  die "TP=$explicit_tp, but $derived_tp ranks are configured (${#_WORKERS[@]} worker(s) plus the head): TP follows WORKERS/the fleet now — remove TP from .env"
+export TP="$derived_tp" DSGB10_TP="$derived_tp"
 
 # A host path under $HOME is the same file at /root in the container.
 in_container() {
@@ -138,16 +151,19 @@ prepare() {
 
   local visionarg=()
   [ "$VISION" = "1" ] && visionarg=(--vision)
+  # --world in ARGS is the explicit way to cut another world: do not repeat it.
+  local worldarg=(--world "$TP") a
+  for a in "$@"; do [ "$a" = "--world" ] && worldarg=(); done
   log "prepare: checkpoint (only if not already complete), then $TP rank file(s) and Engram shards into $out"
   [ "$DRY" = "1" ] && {
     echo "    docker run --rm ${ttyarg[*]} --ipc=host --network host -v $HOME:/root -v /data:/data \\"
-    echo "      $IMAGE prepare/target/release/dsw-prepare prepare --world $TP ${visionarg[*]} $*"
+    echo "      $IMAGE prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${visionarg[*]} $*"
     return 0
   }
   mkdir -p "$out"
   docker run --rm "${ttyarg[@]}" --ipc=host --network host -v "$HOME:/root" -v /data:/data \
     -w /work/ds41f-4xgx10-switchless "${envarg[@]}" \
-    "$IMAGE" prepare/target/release/dsw-prepare prepare --world "$TP" "${visionarg[@]}" "$@" ||
+    "$IMAGE" prepare/target/release/dsw-prepare prepare "${worldarg[@]}" "${visionarg[@]}" "$@" ||
     die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
 }
 

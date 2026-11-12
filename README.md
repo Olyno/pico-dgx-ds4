@@ -148,21 +148,21 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 **In a container (one command).** `./start.sh` builds the image from [Dockerfile](Dockerfile) (engine + front-end,
 `sm_121a`), starts `engine/server/service.sh` inside a host-networked GPU container and waits until the API answers;
 `./stop.sh` stops it and frees the GPU. Settings come from `.env` (see [.env.example](.env.example)): `TP`, `FLEET`,
-`WORKERS`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`, `VISION`.
+`WORKERS`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`, `VISION`. The rank count
+is not among them: it is `1 + the WORKERS targets`.
 
 ```bash
-cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, port
-./start.sh fleet                         # write the fleet file from TP + WORKERS (no hand-editing)
+cp .env.example .env && $EDITOR .env     # WORKERS (three targets = four ranks), port
+./start.sh fleet                         # write the fleet file from WORKERS (no hand-editing)
 ./start.sh prepare                       # once, rank 0: checkpoint (if missing) + rank files + Engram shards
 ./start.sh                               # docker build + service start + smoke test
 ./start.sh status                        # exit 0 while serving
 ./stop.sh                                # graceful stop, then remove the container
 ```
 
-`./start.sh fleet` derives the rank count, per-rank paths and the ring's link addresses from `TP` and
-`WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs.
-`WORKERS` alone is enough: with `TP` unset it is `1 + the targets` (rank 0 is the head, so three targets are `TP=4`),
-which is what `prepare` cuts for and what the ring is built for. The API key
+`./start.sh fleet` derives the rank count, per-rank paths and the ring's link addresses from
+`WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs. The count
+is the list: three targets are a four-rank ring, because rank 0 is the head and runs locally. The API key
 is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
 
 `./start.sh prepare` is the one-time setup on rank 0, run by `dsw-prepare`
@@ -220,8 +220,10 @@ work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fle
 `service.sh` still copies the engine binary and the confidence-gate weights to ranks 1..TP−1 over ssh, so those boxes
 need the same CUDA driver and `rdma-core` (a container on rank 0 only is not enough).
 
-**Tensor parallelism.** `TP` (env, default 4) is the degree the scripts use: the fleet needs `RANK1..RANK{TP-1}_SSH`,
-and `dsw-prepare --world $TP` cuts matching rank files. The engine's kernels and ring are specialised to TP=4, so
+**Tensor parallelism.** The degree is derived, not configured: rank 0 is the head, `WORKERS` names ranks 1..N-1, so
+`TP = 1 + the targets` (and a fleet file names the same ranks; if both are present they must agree). `prepare` cuts
+`--world $TP` rank files, `./start.sh prepare --world N` cuts a different world on purpose, and the `reshard` mode
+re-cuts an existing set for another world without the checkpoint. The engine's kernels and ring are specialised to TP=4, so
 `dsgb10_rank` refuses any other value with a message naming the fix (`engine/common/tp.h`) instead of computing
 garbage; the per-rank shapes all derive from `model::kRanks` (`engine/model/config.h`), which is the one place a
 generalisation starts.
