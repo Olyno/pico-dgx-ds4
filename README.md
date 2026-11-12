@@ -145,6 +145,29 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 
 ## ✧ run it
 
+**In a container (one command).** `./start.sh` builds the image from [Dockerfile](Dockerfile) (engine + front-end,
+`sm_121a`), starts `engine/server/service.sh` inside a host-networked GPU container and waits until the API answers;
+`./stop.sh` stops it and frees the GPU. Settings come from `.env` (see [.env.example](.env.example)): `TP`, `FLEET`,
+`CKPT`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`.
+
+```bash
+cp .env.example .env && $EDITOR .env     # TP=4, FLEET, CKPT, port
+./start.sh                               # docker build + service start + smoke test
+./start.sh status                        # exit 0 while serving
+./stop.sh                                # graceful stop, then remove the container
+```
+
+The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
+work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.
+`service.sh` still copies the engine binary to ranks 1–3 over ssh, so those boxes need the same CUDA driver and
+`rdma-core` (a container on rank 0 only is not enough).
+
+**Tensor parallelism.** `TP` (env, default 4) is the degree the scripts use: the fleet needs `RANK1..RANK{TP-1}_SSH`,
+and `dsw_convert --world $TP` cuts matching rank files. The engine's kernels and ring are specialised to TP=4, so
+`dsgb10_rank` refuses any other value with a message naming the fix (`engine/common/tp.h`) instead of computing
+garbage; the per-rank shapes all derive from `model::kRanks` (`engine/model/config.h`), which is the one place a
+generalisation starts.
+
 This is the exact build behind the numbers above (the engine source in this repo is the source of the binary we serve).
 
 ```

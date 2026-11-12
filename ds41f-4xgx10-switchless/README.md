@@ -198,6 +198,11 @@ with. At its start the engine checks each shard's header and the map's constants
 
 **6. Start serving** (not run on this fleet during the review, where the service is production's):
 
+From the repository root, `./start.sh` does steps 2 and 6 in a container: it builds [Dockerfile](../Dockerfile)
+(engine + front-end for `sm_121a`), runs `engine/server/service.sh start` in a host-networked GPU container and
+waits for the API; `./stop.sh` stops it. Settings come from `.env` (`.env.example` lists them), `TP` included.
+The bare-metal form:
+
 ```bash
 (umask 077; openssl rand -hex 24 > ~/api-key)
 DSGB10_KEY_FILE=~/api-key DSGB10_FRONT_ARGS="--tokenizer $HOME/DeepSeek-V4.1-Flash/tokenizer.json --model-name deepseek-v4.1-flash" \
