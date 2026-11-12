@@ -15,7 +15,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     RUSTUP_HOME=/usr/local/rustup
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ python3 libibverbs-dev rdma-core libnuma-dev \
+    cmake g++ python3 python3-pip libibverbs-dev rdma-core libnuma-dev \
     curl ca-certificates openssh-client rsync iproute2 kmod \
   && rm -rf /var/lib/apt/lists/* \
   && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
