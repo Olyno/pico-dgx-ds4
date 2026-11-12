@@ -209,13 +209,14 @@ work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fle
 `service.sh` still copies the engine binary and the confidence-gate weights to ranks 1..TP−1 over ssh, so those boxes
 need the same CUDA driver and `rdma-core` (a container on rank 0 only is not enough).
 
-**Tensor parallelism.** The degree is the box list, not a setting: rank 0 plus the `WORKERS` targets, and the fleet file
-names the same ranks. `./start.sh prepare --world N` cuts another world on purpose. The engine loads world 4 today:
-`engine/common/tp.h` refuses any other value with a message naming the fix instead of computing garbage, because the
-kernels (per-rank shapes derived from `model::kRanks`, `engine/model/config.h`), the ring (quarter reduce-scatter with
-an opposite-rank relay, `engine/comm/ring.cpp`) and the Engram store (`engine/engram/engram.h`) are built for it.
-Worlds 1 and 2 would also need a box that holds one rank's weights — 507 GB and 254 GB — against 128 GB per GB10;
-world 3 is not a split this model allows (its rows do not divide by 3).
+**Tensor parallelism.** The degree is the box list, not a setting: rank 0 plus the boxes the fleet names. The
+cutter takes the worlds the checkpoint divides — 1, 2 and 4 (3 divides none of its shapes). The engine is one
+build per world, `cmake -DDSGB10_WORLD=1|2|4` (default 4): every per-rank shape, the ring's reduce-scatter and
+the Engram store derive from that one constant ([engine/common/world.h](ds41f-4xgx10-switchless/engine/common/world.h)),
+and a weight file, shard or fleet cut for another world is refused at startup instead of misread. Worlds other
+than 4 cannot be served yet: the attention kernels' warp-to-head mapping is 16 heads per rank and they refuse at
+launch, and one rank would hold 254 GB at world 2, 507 GB at world 1, against 128 GB per GB10. World 4 is the
+fleet's.
 
 This is the exact build behind the numbers above (the engine source in this repo is the source of the binary we serve).
 
