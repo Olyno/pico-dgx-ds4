@@ -117,10 +117,22 @@ elif [ ! -r "$KEY" ]; then
 else
   chmod 600 "$KEY" 2>/dev/null || warn "could not chmod 600 $KEY"
 fi
-[ -f "$CF" ] || {
-  [ "$DRY" = "1" ] && warn "DRY_RUN: $CF missing" ||
-    die "$CF missing: copy ds41f-4xgx10-switchless/tools/stack4/cfmlp_cml.bin there (the engine exits at start without it)"
-}
+# stack4's confidence-gate weights: the repo carries them, the ranks read a copy
+# at $DSGB10_CF_MLP (README step 3). Deploy it here; without it the engine still
+# serves — the shipped confidence head instead, slower drafts, the same tokens.
+GATE_ON=1
+if [ ! -f "$CF" ]; then
+  CF_SRC=$REPO/ds41f-4xgx10-switchless/tools/stack4/cfmlp_cml.bin
+  if [ ! -f "$CF_SRC" ]; then
+    GATE_ON=0
+    warn "$CF and $CF_SRC are both missing: serving without the learned confidence gate (slower drafts, same tokens)"
+  elif [ "$DRY" = "1" ]; then
+    log "DRY_RUN: would copy $CF_SRC -> $CF"
+  else
+    mkdir -p "$(dirname "$CF")" && cp "$CF_SRC" "$CF" &&
+      log "deployed the confidence-gate weights to $CF"
+  fi
+fi
 if [ -n "${CKPT:-}" ] && [ ! -d "$CKPT" ]; then
   die "checkpoint $CKPT not found (deepseek-ai/DeepSeek-V4.1-Flash or DeepSeek-V4.1-Flash-1017)"
 fi
@@ -150,18 +162,23 @@ fi
 # flag given twice counts once, with the command line's value. Every knob that
 # the ranks must agree on goes through --setenv: workers are reached over ssh,
 # which does not forward this environment.
+CFSET=""
+if [ "$GATE_ON" = 1 ]; then
+  CFSET="--setenv DSGB10_CF_MLP=$(in_container "$CF") --setenv DSGB10_CF_ALPHA=1.0"
+fi
 EARGS="${DSGB10_ENGINE_ARGS:---max-ctx 1048576 --slots 16 --big-slots 4 \
 --setenv DSGB10_BUDGET=1 --setenv DSGB10_OEA=4,12,9 --setenv DSGB10_DRAFT1=6 \
 --setenv DSGB10_WIDE=64 --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 \
 --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1 \
---setenv DSGB10_CF_MLP=$(in_container "$CF") --setenv DSGB10_CF_ALPHA=1.0 \
---setenv DSGB10_CERT=1}"
-# The engine exits at start without the confidence-gate weights; a custom
-# DSGB10_ENGINE_ARGS that forgets them gets them here.
-case "$EARGS" in
-  *DSGB10_CF_MLP=*) ;;
-  *) EARGS+=" --setenv DSGB10_CF_MLP=$(in_container "$CF")" ;;
-esac
+$CFSET --setenv DSGB10_CERT=1}"
+# A custom DSGB10_ENGINE_ARGS that forgets the gate gets it here — when it is
+# available; the engine serves without it, on the shipped confidence head.
+if [ "$GATE_ON" = 1 ]; then
+  case "$EARGS" in
+    *DSGB10_CF_MLP=*) ;;
+    *) EARGS+=" --setenv DSGB10_CF_MLP=$(in_container "$CF")" ;;
+  esac
+fi
 [ -n "${DSGB10_RING_DIRECT:-}" ] && EARGS+=" --setenv DSGB10_RING_DIRECT=$DSGB10_RING_DIRECT"
 [ $# -gt 0 ] && EARGS+=" $*"
 FARGS="${DSGB10_FRONT_ARGS:---tokenizer $(in_container "${CKPT:-$HOME/DeepSeek-V4.1-Flash}")/tokenizer.json --model-name deepseek-v4.1-flash}"
@@ -174,11 +191,11 @@ run_args=(
   -e "TP=$TP" -e "DSGB10_TP=$TP" -e FLEET=/root/fleet.conf
   -e "DSGB10_PORT=$PORT" -e "DSGB10_ADDR=$ADDR"
   -e "DSGB10_KEY_FILE=$(in_container "$KEY")"
-  -e "DSGB10_CF_MLP=$(in_container "$CF")"  # service.sh copies it to every worker
   -e "DSGB10_ENGINE_ARGS=$EARGS"
   -e "DSGB10_FRONT_ARGS=$FARGS"
 )
 [ "$NO_AUTH" = "1" ] && run_args+=(-e DSGB10_NO_AUTH=1)
+[ "$GATE_ON" = 1 ] && run_args+=(-e "DSGB10_CF_MLP=$(in_container "$CF")")  # service.sh copies it to workers
 cmd=(docker run)
 [ "${FOREGROUND:-0}" = "1" ] || cmd+=(-d)
 cmd+=("${run_args[@]}" "$IMAGE" bash -c 'engine/server/service.sh start && sleep infinity')
