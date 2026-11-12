@@ -373,9 +373,10 @@ done
 
 # The kernels and the ring are TP=4 by construction (engine/common/tp.h). Cutting
 # another world on the way to serving would spend hours on files no build can
-# load, so the default run refuses; ./start.sh prepare --world N still can, on
-# purpose (and says so).
-if [ "$TP" != "4" ] && [ "$MODE" != "prepare" ]; then
+# load, so serving refuses. Everything else touches files or the container, never
+# the kernels: `prepare --world N` cuts on purpose, `clear` deletes, `status`
+# reports, and all three work with any fleet.
+if [ "$TP" != "4" ] && [ "$MODE" = "run" ]; then
   die "the engine loads TP=4 only (engine/common/tp.h), so $TP rank(s) could never be served.
   The rank count follows the boxes you name: put three ssh targets in WORKERS, or let the
   fleet file name ranks 1..3. For another split on purpose: ./start.sh prepare --world N"
