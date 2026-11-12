@@ -1,0 +1,14 @@
+# Build context for the DS4 image: sources only. Root-relative entries start
+# with / so that, e.g., engine/server/tools is not dropped with /tools.
+.git
+.env
+**/build
+**/build-*
+**/target
+**/__pycache__
+**/*.o
+**/*.so
+/altar1-4xgx10-switchless
+/tools
+/assets
+/CHANGES.md
