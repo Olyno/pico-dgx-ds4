@@ -130,11 +130,11 @@ clear_outputs() {
   for a in "$@"; do [ "$a" = "--out" ] && outarg=(); done
   log "clear: deleting the rank files, journals, Engram shards and scratch of earlier runs in $OUT"
   if [ "$DRY" = "1" ]; then
-    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root \\"
+    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root -v /data:/data \\"
     echo "      $IMAGE prepare/target/release/dsw-prepare clear ${outarg[*]} $*"
     return 0
   fi
-  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" \
+  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" -v /data:/data \
     "$IMAGE" prepare/target/release/dsw-prepare clear "${outarg[@]}" "$@" || die "clear failed"
 }
 
@@ -178,7 +178,9 @@ prepare() {
     echo "    ${cmd[*]} $IMAGE prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${outarg[*]} ${args[*]}"
     return 0
   fi
-  mkdir -p "$OUT"
+  # No mkdir here: the tool creates every directory it writes as root in the
+  # container, and the head user may not be allowed to (an OUT on a root-owned
+  # disk such as /data would fail before the run even started).
   "${cmd[@]}" "$IMAGE" prepare/target/release/dsw-prepare prepare "${worldarg[@]}" "${outarg[@]}" "${args[@]}" ||
     die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
 }
@@ -316,6 +318,16 @@ for arg in "$@"; do
 done
 
 [[ "$TP" =~ ^[1-9][0-9]*$ ]] || die "TP='$TP' is not a positive integer (tensor-parallel degree)"
+
+# The kernels and the ring are TP=4 by construction (engine/common/tp.h). Cutting
+# another world on the way to serving would spend hours on files no build can
+# load, so the default run refuses; ./start.sh prepare --world N still can, on
+# purpose (and says so).
+if [ "$TP" != "4" ] && [ "$MODE" != "prepare" ] && [ "$MODE" != "reshard" ]; then
+  die "TP=$TP, but the engine loads TP=4 only (engine/common/tp.h), so files cut at $TP could never be served.
+  TP follows the boxes you name: put three ssh targets in WORKERS, or let the fleet file name
+  ranks 1..3 (WORKERS=\"u@a u@b u@c\"). For another split on purpose: ./start.sh prepare --world N"
+fi
 
 # ./start.sh fleet: write the fleet file from TP + WORKERS instead of hand-editing it.
 if [ "$MODE" = "fleet" ]; then
