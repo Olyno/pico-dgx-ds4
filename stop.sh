@@ -18,7 +18,7 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 CONTAINER="${CONTAINER_NAME:-pico-dgx-ds4}"
-PORT="${DSGB10_PORT:-18893}"
+PORT="${PORT:-${DSGB10_PORT:-8888}}"
 STOP_TIMEOUT="${STOP_TIMEOUT:-30}"
 FORGET=""
 [ "${1:-}" = "--forget" ] && FORGET="--forget"

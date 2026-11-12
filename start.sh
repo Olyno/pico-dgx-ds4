@@ -50,7 +50,7 @@ fi
 IMAGE="${IMAGE:-pico-dgx-ds4:latest}"
 CONTAINER="${CONTAINER_NAME:-pico-dgx-ds4}"
 FLEET="${FLEET:-$REPO/ds41f-4xgx10-switchless/fleet/homelab.conf}"
-PORT="${PORT:-${DSGB10_PORT:-18893}}"
+PORT="${PORT:-${DSGB10_PORT:-8888}}"
 ADDR="${ADDR:-${DSGB10_ADDR:-127.0.0.1}}"
 MODEL="${MODEL:-${DSGB10_MODEL:-deepseek-v4.1-flash}}"
 NO_AUTH="${NO_AUTH:-${DSGB10_NO_AUTH:-0}}"
@@ -545,6 +545,8 @@ run_args=(
   -v "$HOME:/root" -v /data:/data -v "$FLEET:/root/fleet.conf:ro"
   -e "TP=$TP" -e "DSGB10_TP=$TP" -e FLEET=/root/fleet.conf
   -e "DSGB10_PORT=$PORT" -e "DSGB10_ADDR=$ADDR"
+  # 8888 is the engine's production endpoint: service.sh refuses it without this.
+  -e DSGB10_PROD=1
   -e "DSGB10_KEY_FILE=$(in_container "$KEY")"
   -e "DSGB10_ENGINE_ARGS=$EARGS"
   -e "DSGB10_FRONT_ARGS=$FARGS"

@@ -154,8 +154,9 @@ resume, nothing is asked. Settings come from `.env` (see [.env.example](.env.exa
 the name the API answers to. The rank list is the fleet file, which `WORKERS` writes when it does not exist yet.
 
 ```bash
-cp .env.example .env && $EDITOR .env     # FLEET; WORKERS if the fleet is not written yet
+cp .env.example .env && $EDITOR .env     # optional: PORT, ADDR, MODEL, ...
 ./start.sh                               # everything; a second run is a no-op while it serves
+                                         # the API comes up on http://127.0.0.1:8888/v1
 ./start.sh status                        # exit 0 while serving
 ./stop.sh                                # graceful stop, then remove the container
 ```
