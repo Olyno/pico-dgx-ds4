@@ -128,7 +128,11 @@ prepare() {
     [ "${free:-0}" -ge "$2" ] && return 0
     local msg="only ${free:-?} GiB free on $d; $3 needs ~$2 GiB"
     [ "$DRY" = "1" ] && { warn "DRY_RUN: $msg"; return 0; }
-    die "$msg (NEED_GB / OUT_GB override; /data is the other mount the container sees)"
+    die "$msg
+  the checkpoint and this staging are separate allocations: a complete checkpoint does not
+  count towards it. Free ~$(( $2 - ${free:-0} )) GiB more, or put the staging on another
+  mount with PREPARE_OUT=/data/dsgb10/convert (/data is mounted in the container), or cut one
+  rank at a time (OUT_GB=130) and move each file off before the next."
   }
   local need_ckpt=0
   [ -f "$ckpt/config.json" ] || need_ckpt=${NEED_GB:-520}
