@@ -361,6 +361,15 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
             }
         }
         _ => {
+            // "local" means the weights are here: a missing checkpoint is an
+            // error, not a 507 GB download. (Auto only resolves to local when it
+            // opens, so this can only be the explicit flag.)
+            if source == "local" && !dsw_prepare::checkpoint::has_shards(ckpt) {
+                die(&format!(
+                    "--source local: no checkpoint at {} (drop --source local to download it, or pass --ckpt DIR)",
+                    ckpt.display()
+                ));
+            }
             let ck = ensure_checkpoint(ckpt, repo, rev);
             let paths: Vec<PathBuf> = ck.shards.iter().map(|s| s.path.clone().expect("a local checkpoint has paths")).collect();
             let r = LocalReader::open(&paths).unwrap_or_else(|e| die(&format!("opening the shards: {e}")));

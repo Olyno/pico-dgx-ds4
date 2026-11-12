@@ -19,8 +19,8 @@
 #       --source S        local | hybrid | http (the default takes the local one)
 #   DRY_RUN=1 ./start.sh  print every command, change nothing
 #
-# Settings come from ./.env: DSGB10_PORT, DSGB10_ADDR (the API), DSGB10_MODEL (the
-# name it answers to). The rank list is FLEET, and it is the rank count: rank 0 is
+# Settings come from ./.env: PORT and ADDR (the API), MODEL (the name it answers
+# to), IS_LOCAL, NO_AUTH, RING_DIRECT, VISION. The rank list is FLEET, and it is the rank count: rank 0 is
 # the head and every other box the file names is one more rank. WORKERS only
 # writes that file when it does not exist. The engine loads world 4 only today
 # (engine/common/tp.h); the cutter takes the worlds the model allows, 1, 2 and 4.
@@ -44,19 +44,26 @@ if [ -f "$ENV_FILE" ]; then
   set +a
   echo "[start.sh] loaded env from $ENV_FILE"
 fi
+# The settings the API has: where it listens, what it answers to. The DSGB10_*
+# names of the engine's own environment are an internal detail (the old spellings
+# are still accepted, in case an .env predates this).
 IMAGE="${IMAGE:-pico-dgx-ds4:latest}"
 CONTAINER="${CONTAINER_NAME:-pico-dgx-ds4}"
-FLEET_ENV="${FLEET:-}"  # what the user named, before the repo default
-FLEET="${FLEET_ENV:-$REPO/ds41f-4xgx10-switchless/fleet/homelab.conf}"
-PORT="${DSGB10_PORT:-18893}"
-ADDR="${DSGB10_ADDR:-127.0.0.1}"
+FLEET="${FLEET:-$REPO/ds41f-4xgx10-switchless/fleet/homelab.conf}"
+PORT="${PORT:-${DSGB10_PORT:-18893}}"
+ADDR="${ADDR:-${DSGB10_ADDR:-127.0.0.1}}"
+MODEL="${MODEL:-${DSGB10_MODEL:-deepseek-v4.1-flash}}"
+NO_AUTH="${NO_AUTH:-${DSGB10_NO_AUTH:-0}}"
+RING_DIRECT="${RING_DIRECT:-${DSGB10_RING_DIRECT:-}}"
 KEY="${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}"
 CF="${DSGB10_CF_MLP:-$HOME/cfmlp_cml.bin}"
-NO_AUTH="${DSGB10_NO_AUTH:-0}"
 
-# VISION=1 keeps the image encoder's slice of the checkpoint (prepare --vision) and
-# points dsfront at it; VISION_IMAGE is the torch/PIL image that runs the encoder.
-VISION="${VISION:-0}"
+# Vision is part of the model, so it is on: the encoder's slice of the checkpoint
+# is kept (prepare --vision, ~2.3 GB) and dsfront accepts image parts. Running
+# the encoder itself needs a torch/PIL image — VISION_IMAGE, or one built with
+# tools/vision/Dockerfile and tagged pico-dgx-ds4-vision. Without it text works
+# and image parts answer 503. VISION=0 refuses them as before.
+VISION="${VISION:-1}"
 VISION_DIR="${VISION_DIR:-$HOME/dsgb10/vision}"
 VISION_PORT=18950
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
@@ -194,6 +201,11 @@ prepare() {
     [ "$VISION" = "1" ] && args+=(--vision)
     args+=(--replace --consume)
   fi
+  # IS_LOCAL=1: the weights are on this machine, so nothing is fetched for them
+  # (the tool fails instead of downloading when the checkpoint is not there).
+  if [ "${IS_LOCAL:-0}" = "1" ]; then
+    case " ${args[*]} " in *" --source "*) ;; *) args+=(--source local) ;; esac
+  fi
   log "prepare: $TP rank file(s), Engram shards and the hash map into $OUT"
   # --cpu-shares, not --cpus: the conversion takes every core while the box is
   # idle and steps aside when something else wants them (a third of the CPU).
@@ -310,23 +322,32 @@ ensure_artifacts() {
 # an image of its own, named by VISION_IMAGE, not the engine image.
 start_vision() {
   [ "$VISION" = "1" ] || return 0
-  if [ -z "${VISION_IMAGE:-}" ]; then
-    warn "VISION=1 but VISION_IMAGE is unset: start tools/vision/vision_encoder.py yourself; image requests answer 503 until it runs"
+  local img="${VISION_IMAGE:-pico-dgx-ds4-vision:latest}"
+  local tools="$REPO/ds41f-4xgx10-switchless/tools/vision"
+  if [ ! -f "$VISION_DIR/model.safetensors.index.json" ]; then
+    log "vision: no bundle in $VISION_DIR yet (the next prepare keeps one); text only for now"
     return 0
   fi
-  [ -f "$VISION_DIR/model.safetensors.index.json" ] ||
-    die "no vision bundle in $VISION_DIR: run VISION=1 ./start.sh prepare first"
   if [ "$DRY" = "1" ]; then
-    log "DRY_RUN: docker run $VISION_IMAGE /app/vision_encoder.py --host 127.0.0.1 --port $VISION_PORT (model $VISION_DIR)"
+    log "DRY_RUN: docker run $img /app/vision_encoder.py --host 127.0.0.1 --port $VISION_PORT (model $VISION_DIR)"
     return 0
+  fi
+  # One build, then it is just another local image. Non-fatal: without it the
+  # engine still serves text.
+  if ! docker image inspect "$img" >/dev/null 2>&1; then
+    if docker build -t "$img" -f "$tools/Dockerfile" "$tools" >/dev/null 2>&1; then
+      log "vision: built $img (torch runtime + pillow + safetensors)"
+    else
+      log "vision: no encoder image $img and it could not be built: text works, image parts answer 503"
+      return 0
+    fi
   fi
   docker rm -f dsgx10-vision >/dev/null 2>&1 || true
   docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g \
-    -e VISION_PRELOAD=1 -v "$VISION_DIR:/model:ro" \
-    -v "$REPO/ds41f-4xgx10-switchless/tools/vision:/app:ro" \
-    --entrypoint python3 "$VISION_IMAGE" /app/vision_encoder.py \
+    -e VISION_PRELOAD=1 -v "$VISION_DIR:/model:ro" -v "$tools:/app:ro" \
+    --entrypoint python3 "$img" /app/vision_encoder.py \
     --host 127.0.0.1 --port "$VISION_PORT" >/dev/null ||
-    die "the vision encoder did not start from image $VISION_IMAGE"
+    die "the vision encoder did not start from image $img"
   log "vision encoder on 127.0.0.1:$VISION_PORT (model $VISION_DIR)"
 }
 
@@ -489,12 +510,12 @@ CFSET=""
 if [ "$GATE_ON" = 1 ]; then
   CFSET="--setenv DSGB10_CF_MLP=$(in_container "$CF") --setenv DSGB10_CF_ALPHA=1.0"
 fi
-EARGS="${DSGB10_ENGINE_ARGS:---max-ctx 1048576 --slots 16 --big-slots 4 \
+EARGS="${ENGINE_ARGS:-${DSGB10_ENGINE_ARGS:---max-ctx 1048576 --slots 16 --big-slots 4 \
 --setenv DSGB10_BUDGET=1 --setenv DSGB10_OEA=4,12,9 --setenv DSGB10_DRAFT1=6 \
 --setenv DSGB10_WIDE=64 --setenv DSGB10_WIDE_COST=24,2.2,57,1.1 \
 --draft-head4 --draft-markov8 --setenv DSGB10_HEAD4_C1=1 \
-$CFSET --setenv DSGB10_CERT=1}"
-# A custom DSGB10_ENGINE_ARGS that forgets the gate gets it here — when it is
+$CFSET --setenv DSGB10_CERT=1}}"
+# A custom ENGINE_ARGS that forgets the gate gets it here — when it is
 # available; the engine serves without it, on the shipped confidence head.
 if [ "$GATE_ON" = 1 ]; then
   case "$EARGS" in
@@ -502,12 +523,12 @@ if [ "$GATE_ON" = 1 ]; then
     *) EARGS+=" --setenv DSGB10_CF_MLP=$(in_container "$CF")" ;;
   esac
 fi
-[ -n "${DSGB10_RING_DIRECT:-}" ] && EARGS+=" --setenv DSGB10_RING_DIRECT=$DSGB10_RING_DIRECT"
+[ -n "${RING_DIRECT:-}" ] && EARGS+=" --setenv DSGB10_RING_DIRECT=$RING_DIRECT"
 [ $# -gt 0 ] && EARGS+=" $*"
-if [ -n "${DSGB10_FRONT_ARGS:-}" ]; then
-  FARGS="$DSGB10_FRONT_ARGS"
+if [ -n "${FRONT_ARGS:-${DSGB10_FRONT_ARGS:-}}" ]; then
+  FARGS="${FRONT_ARGS:-$DSGB10_FRONT_ARGS}"
 else
-  FARGS="--tokenizer $(in_container "${TOKENIZER:-$HOME/DeepSeek-V4.1-Flash/tokenizer.json}") --model-name ${DSGB10_MODEL:-deepseek-v4.1-flash}"
+  FARGS="--tokenizer $(in_container "${TOKENIZER:-$HOME/DeepSeek-V4.1-Flash/tokenizer.json}") --model-name $MODEL"
 fi
 # VISION=1 accepts image parts; without the address dsfront refuses them as before.
 if [ "$VISION" = "1" ]; then

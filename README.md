@@ -177,11 +177,12 @@ Where the bytes come from is chosen automatically: a checkpoint that is already 
 `dsw-prepare` downloads through the hybrid source — each ordinary shard whole, one at a time, deleted after it is converted, and
 the two 101.5 GB Engram shards by range, so they never touch the disk. `--source local|http|hybrid` forces one.
 
-**Images.** `VISION=1` saves the encoder's slice of the checkpoint (~2.3 GB: the publisher's `inference/` scripts, a trimmed
-index, and the shards holding `vision.`/`aligner.`/`image_` tensors) into `~/dsgb10/vision`, so the rest of the checkpoint can be
-released and vision still works. It also points dsfront at `127.0.0.1:18950`; `VISION_IMAGE=<image with torch + PIL + safetensors>`
-makes `start.sh` run `tools/vision/vision_encoder.py` from that bundle. `VISION=0` (the default) refuses image parts, as before.
-Enabling it later costs at most a re-download of those 2.3 GB, never the 510 GB checkpoint.
+**Images.** Vision is on: `prepare` keeps the encoder's slice of the checkpoint (~2.3 GB: the publisher's
+`inference/` scripts, a trimmed index and the shards holding `vision.`/`aligner.`/`image_` tensors) in
+`~/dsgb10/vision`, so the rest of the checkpoint can be released and images still work, and dsfront accepts image
+parts at `127.0.0.1:18950`. The encoder runs from a torch/PIL image — built from
+[tools/vision/Dockerfile](ds41f-4xgx10-switchless/tools/vision/Dockerfile) on first use, or whatever
+`VISION_IMAGE` names; without one, text works and image parts answer 503. `VISION=0` refuses image parts.
 
 Outputs that belong to another checkpoint or world are never reused: `./start.sh` replaces them, and an explicit
 `prepare` lists them and asks on the terminal first. The space a run needs is computed from the plan, not from an
