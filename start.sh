@@ -16,6 +16,7 @@
 #       --world N         cut N ranks instead of the fleet's (1, 2 or 4; not 3)
 #       --consume         release the checkpoint as its outputs verify
 #       --ckpt DIR        a checkpoint somewhere other than the ones searched
+#       --repair          a checkpoint that does not open: download what is wrong in it
 #       --source S        local | hybrid | http (the default takes the local one)
 #   DRY_RUN=1 ./start.sh  print every command, change nothing
 #

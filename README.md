@@ -196,6 +196,7 @@ Extra arguments go to `dsw-prepare`:
 | `--world N` | cuts N ranks instead of the fleet's (the model allows 1, 2 and 4; 3 does not divide). The default run always cuts the fleet's |
 | `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run. The space it needs is the run's **peak** — one shard's outputs, not the whole set. The default run does this; without it the checkpoint is kept and the run refuses if both cannot fit |
 | `--ckpt DIR` | the checkpoint, when it is not in one of the places searched (`~/DeepSeek-V4.1-Flash[-1017]`, `/data/models/*`, the Hub cache) |
+| `--repair` | the local checkpoint exists but does not open (a short or corrupt shard): keep it and let the download fetch only what is wrong. Without it, such a copy is refused rather than replaced by a blind 507 GB download |
 | `--source local\|hybrid\|http` | where the bytes come from; the default uses the local checkpoint when it opens, and otherwise the hybrid stream (each ordinary shard whole and deleted after conversion, the two 101.5 GB Engram shards by range) |
 
 Every batch is journaled (`rank<r>.dsw.journal`) after its outputs are written, verified and synced, so an interrupted

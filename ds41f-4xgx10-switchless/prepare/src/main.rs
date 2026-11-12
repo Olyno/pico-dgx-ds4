@@ -132,6 +132,7 @@ fn main() {
     let mut source = "auto".to_string();
     let mut consume = false;
     let mut replace = false;
+    let mut repair = false;
     let mut clear = false;
     let mut verify = true;
     let mut resume = true;
@@ -178,6 +179,7 @@ fn main() {
             }
             "--consume" => consume = true,
             "--replace" => replace = true,
+            "--repair" => repair = true,
             "--clear" | "--reset" => clear = true,
             "--no-verify" => verify = false,
             "--no-resume" => resume = false,
@@ -220,7 +222,7 @@ fn main() {
                 vision: vision.then(|| vision_dir.clone()),
                 model: "deepseek-v4.1-flash".into(),
             };
-            prepare(&ckpt, &o, &source, &repo, &rev, &endpoint, replace, clear);
+            prepare(&ckpt, &o, &source, &repo, &rev, &endpoint, replace, clear, repair);
         }
         "verify" => {
             let f = file.unwrap_or_else(|| die("verify needs --file"));
@@ -325,18 +327,33 @@ fn main() {
     }
 }
 
-fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoint: &str, replace: bool, clear: bool) {
+fn prepare(
+    ckpt: &Path,
+    o: &Options,
+    source: &str,
+    repo: &str,
+    rev: &str,
+    endpoint: &str,
+    replace: bool,
+    clear: bool,
+    repair: bool,
+) {
     // The local checkpoint wins whenever it is already complete; a download goes
     // through the hybrid source, which keeps one shard on disk at a time.
     let source: &str = if source == "auto" {
         match Checkpoint::open(ckpt) {
             Ok(_) => "local",
+            // --repair: re-download into the same directory. `hf download` fetches
+            // the files that are short or wrong and skips the rest, so this is a
+            // repair, not 507 GB.
+            Err(_) if repair => "local",
             // A directory that holds shards is not "nothing to lose": quietly
             // downloading 507 GB over a copy that will not open is how a run
             // that should have failed in a second hangs for hours.
             Err(why) if dsw_prepare::checkpoint::has_shards(ckpt) => die(&format!(
-                "{why}\n  the checkpoint at {} is there but unusable: delete it to download a fresh \
-                 copy, point --ckpt at an intact one, or pass --source hybrid to ignore it",
+                "{why}\n  the checkpoint at {} is there but unusable: pass --repair to let the \
+                 download fetch what is wrong, delete it to start over, point --ckpt at an intact \
+                 one, or pass --source hybrid to ignore it",
                 ckpt.display()
             )),
             Err(_) => "hybrid",
