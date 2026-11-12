@@ -132,12 +132,15 @@ prepare() {
   the checkpoint and this staging are separate allocations: a complete checkpoint does not
   count towards it. Free ~$(( $2 - ${free:-0} )) GiB more, or put the staging on another
   mount with PREPARE_OUT=/data/dsgb10/convert (/data is mounted in the container), or cut one
-  rank at a time (OUT_GB=130) and move each file off before the next."
+  rank at a time and move each file off before the next (OUT_GB=$per_rank_gb at TP=$TP)."
   }
   local need_ckpt=0
   [ -f "$ckpt/config.json" ] || need_ckpt=${NEED_GB:-520}
+  # A rank file is the checkpoint cut TP ways: 78 GB at TP=4, so ~312/TP. The Engram
+  # shards are the kit's fixed 4-way row split, 50.7 GB a rank whatever TP is.
+  local per_rank_gb=$(((312 + TP - 1) / TP + 52))
   space_ok "$ckpt" "$need_ckpt" "the checkpoint"
-  space_ok "$out" $((TP * ${OUT_GB:-130})) "the rank files and Engram shards (TP=$TP)"
+  space_ok "$out" $((TP * ${OUT_GB:-$per_rank_gb})) "the rank files and Engram shards (TP=$TP)"
 
   if [ "$nodl" = 1 ]; then
     log "prepare: --no-download, using $ckpt"
