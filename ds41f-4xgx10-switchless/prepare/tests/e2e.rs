@@ -115,6 +115,7 @@ fn options(out: &Path, consume: bool) -> Options {
         verify: true,
         resume: true,
         engram: true,
+        vision: None,
         model: "deepseek-v4.1-flash".into(),
     }
 }

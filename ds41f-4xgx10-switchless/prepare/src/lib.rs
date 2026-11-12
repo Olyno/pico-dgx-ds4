@@ -40,3 +40,4 @@ pub mod safetensors;
 pub mod source;
 pub mod space;
 pub mod tile;
+pub mod vision;

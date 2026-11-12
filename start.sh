@@ -48,6 +48,11 @@ ADDR="${DSGB10_ADDR:-127.0.0.1}"
 KEY="${DSGB10_KEY_FILE:-$HOME/dsgb10-data/dev-api-key}"
 CF="${DSGB10_CF_MLP:-$HOME/cfmlp_cml.bin}"
 NO_AUTH="${DSGB10_NO_AUTH:-0}"
+# VISION=1 keeps the image encoder's slice of the checkpoint (prepare --vision) and
+# points dsfront at it; VISION_IMAGE is the torch/PIL image that runs the encoder.
+VISION="${VISION:-0}"
+VISION_DIR="${VISION_DIR:-$HOME/dsgb10/vision}"
+VISION_PORT=18950
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 DRY="${DRY_RUN:-0}"
 
@@ -100,17 +105,44 @@ prepare() {
   local ttyarg=()
   [ -t 0 ] && ttyarg=(-it)
 
+  local visionarg=()
+  [ "$VISION" = "1" ] && visionarg=(--vision)
   log "prepare: checkpoint (only if not already complete), then $TP rank file(s) and Engram shards into $out"
   [ "$DRY" = "1" ] && {
     echo "    docker run --rm ${ttyarg[*]} --ipc=host --network host -v $HOME:/root -v /data:/data \\"
-    echo "      $IMAGE prepare/target/release/dsw-prepare prepare --world $TP $*"
+    echo "      $IMAGE prepare/target/release/dsw-prepare prepare --world $TP ${visionarg[*]} $*"
     return 0
   }
   mkdir -p "$out"
   docker run --rm "${ttyarg[@]}" --ipc=host --network host -v "$HOME:/root" -v /data:/data \
     -w /work/ds41f-4xgx10-switchless "${envarg[@]}" \
-    "$IMAGE" prepare/target/release/dsw-prepare prepare --world "$TP" "$@" ||
+    "$IMAGE" prepare/target/release/dsw-prepare prepare --world "$TP" "${visionarg[@]}" "$@" ||
     die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
+}
+
+# The image encoder is a side process on rank 0 (docs/vision.md): it imports the
+# checkpoint's own inference/vision.py, so it needs torch, PIL and safetensors —
+# an image of its own, named by VISION_IMAGE, not the engine image.
+start_vision() {
+  [ "$VISION" = "1" ] || return 0
+  if [ -z "${VISION_IMAGE:-}" ]; then
+    warn "VISION=1 but VISION_IMAGE is unset: start tools/vision/vision_encoder.py yourself; image requests answer 503 until it runs"
+    return 0
+  fi
+  [ -f "$VISION_DIR/model.safetensors.index.json" ] ||
+    die "no vision bundle in $VISION_DIR: run VISION=1 ./start.sh prepare first"
+  if [ "$DRY" = "1" ]; then
+    log "DRY_RUN: docker run $VISION_IMAGE /app/vision_encoder.py --host 127.0.0.1 --port $VISION_PORT (model $VISION_DIR)"
+    return 0
+  fi
+  docker rm -f dsgx10-vision >/dev/null 2>&1 || true
+  docker run -d --name dsgx10-vision --restart unless-stopped --gpus all --net=host --memory=6g \
+    -e VISION_PRELOAD=1 -v "$VISION_DIR:/model:ro" \
+    -v "$REPO/ds41f-4xgx10-switchless/tools/vision:/app:ro" \
+    --entrypoint python3 "$VISION_IMAGE" /app/vision_encoder.py \
+    --host 127.0.0.1 --port "$VISION_PORT" >/dev/null ||
+    die "the vision encoder did not start from image $VISION_IMAGE"
+  log "vision encoder on 127.0.0.1:$VISION_PORT (model $VISION_DIR)"
 }
 
 MODE=start
@@ -243,6 +275,13 @@ fi
 [ -n "${DSGB10_RING_DIRECT:-}" ] && EARGS+=" --setenv DSGB10_RING_DIRECT=$DSGB10_RING_DIRECT"
 [ $# -gt 0 ] && EARGS+=" $*"
 FARGS="${DSGB10_FRONT_ARGS:---tokenizer $(in_container "${TOKENIZER:-$HOME/DeepSeek-V4.1-Flash/tokenizer.json}") --model-name deepseek-v4.1-flash}"
+# VISION=1 accepts image parts; without the address dsfront refuses them as before.
+if [ "$VISION" = "1" ]; then
+  case "$FARGS" in
+    *--vision-addr*) ;;
+    *) FARGS+=" --vision-addr 127.0.0.1:$VISION_PORT" ;;
+  esac
+fi
 
 run_args=(
   --name "$CONTAINER" --gpus all --network host --ipc=host
@@ -265,6 +304,7 @@ if [ "$DRY" = "1" ]; then
   log "DRY_RUN: ${cmd[*]}"
   exit 0
 fi
+start_vision
 log "starting $CONTAINER (TP=$TP, port $PORT)"
 "${cmd[@]}"
 

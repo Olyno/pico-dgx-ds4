@@ -69,7 +69,9 @@ fn main() {
     let mut out = home().join("dsgb10/convert");
     let mut world = 4u32;
     let mut ranks: Option<Vec<u32>> = None;
-    let mut source = "local".to_string();
+    // auto: the local checkpoint when it is already complete, otherwise hybrid
+    // (whole shards downloaded one at a time, the oversized ones by range).
+    let mut source = "auto".to_string();
     let mut consume = false;
     let mut replace = false;
     let mut verify = true;
@@ -82,6 +84,9 @@ fn main() {
     let mut file: Option<PathBuf> = None;
     let mut rank: Option<u32> = None;
     let mut dump = false;
+    // VISION=1 keeps the encoder's slice of the checkpoint; the flags override it.
+    let mut vision = std::env::var("VISION").map(|v| v == "1").unwrap_or(false);
+    let mut vision_dir = home().join("dsgb10/vision");
 
     let mut i = 1;
     while i < args.len() {
@@ -104,8 +109,8 @@ fn main() {
             "--rank" => rank = Some(arg(&args, &mut i, a).parse().unwrap_or_else(|_| die("--rank: not a number"))),
             "--source" => {
                 let v = arg(&args, &mut i, a);
-                if !matches!(v, "local" | "http" | "hybrid") {
-                    die("--source is local, http or hybrid");
+                if !matches!(v, "auto" | "local" | "http" | "hybrid") {
+                    die("--source is auto, local, http or hybrid");
                 }
                 source = v.into();
             }
@@ -126,6 +131,9 @@ fn main() {
             // One line per tensor, the format `plan_dump` prints: the two plans are
             // compared with `diff` on the same checkpoint.
             "--dump" => dump = true,
+            "--vision" => vision = true,
+            "--no-vision" => vision = false,
+            "--vision-dir" => vision_dir = PathBuf::from(arg(&args, &mut i, a)),
             "-h" | "--help" => usage(),
             other => die(&format!("unknown argument {other}")),
         }
@@ -135,7 +143,18 @@ fn main() {
     match cmd.as_str() {
         "prepare" => {
             let ranks = ranks.unwrap_or_else(|| (0..world).collect());
-            let o = Options { world, ranks, out: out.clone(), dest, consume, verify, resume, engram, model: "deepseek-v4.1-flash".into() };
+            let o = Options {
+                world,
+                ranks,
+                out: out.clone(),
+                dest,
+                consume,
+                verify,
+                resume,
+                engram,
+                vision: vision.then(|| vision_dir.clone()),
+                model: "deepseek-v4.1-flash".into(),
+            };
             prepare(&ckpt, &o, &source, &repo, &rev, &endpoint, replace);
         }
         "verify" => {
@@ -205,6 +224,17 @@ fn main() {
 }
 
 fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoint: &str, replace: bool) {
+    // The local checkpoint wins whenever it is already complete; a download goes
+    // through the hybrid source, which keeps one shard on disk at a time.
+    let source: &str = if source == "auto" {
+        if Checkpoint::open(ckpt).is_ok() {
+            "local"
+        } else {
+            "hybrid"
+        }
+    } else {
+        source
+    };
     let (ck, reader, note): (Checkpoint, Box<dyn Reader>, String) = match source {
         "http" | "hybrid" => {
             let (ck, remote, names) = http_checkpoint(endpoint, repo, rev);
@@ -267,6 +297,11 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
     if source == "hybrid" {
         need += ck.shards.iter().map(|s| s.size).filter(|&b| b <= HYBRID_MAX_CACHED).max().unwrap_or(0);
     }
+    // The vision bundle is a second copy of the shards the encoder reads.
+    if o.vision.is_some() {
+        let v: u64 = dsw_prepare::vision::shards_needed(&ck).iter().map(|&i| ck.shards[i].size).sum();
+        need += v;
+    }
 
     // Admission: the outputs must fit, plus the reserve. A local source is already
     // allocated, so it is not added again; --consume only frees it later.
@@ -282,6 +317,11 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
         ));
     }
 
+    // Before the conversion, so releasing the checkpoint cannot cost the encoder
+    // its weights.
+    if let Some(dir) = &o.vision {
+        write_vision(&ck, dir, reader.as_ref());
+    }
     convert::run(&ck, reader.as_ref(), o, &note).unwrap_or_else(|e| die(&e));
     if let Err(e) = &hashmap(&ck, o) {
         eprintln!("[dsw-prepare] WARN: the Engram hash map was not written: {e}");
@@ -297,6 +337,34 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
         }
     }
     print_distribution(o);
+}
+
+/// Saves the vision encoder's slice of the checkpoint: its scripts, the index and
+/// the shards holding `vision.`/`aligner.`/`image_` tensors. A warning, not a
+/// failure, when the model has no vision at all.
+fn write_vision(ck: &Checkpoint, dest: &Path, reader: &dyn Reader) {
+    let materialize = |i: usize, to: &Path| -> Result<(), String> {
+        if let Some(p) = reader.local_path(i) {
+            return std::fs::copy(&p, to).map(|_| ()).map_err(|e| format!("{}: {e}", p.display()));
+        }
+        // A pure-range reader has no copy to give; a hybrid one fetches it.
+        reader.prepare(i).map_err(|e| e.to_string())?;
+        let out = match reader.local_path(i) {
+            Some(p) => std::fs::copy(&p, to).map(|_| ()).map_err(|e| format!("{}: {e}", p.display())),
+            None => Err("a vision bundle needs a local or hybrid source".into()),
+        };
+        reader.finish(i);
+        out
+    };
+    match dsw_prepare::vision::write(ck, dest, &materialize) {
+        Ok(b) => println!(
+            "[dsw-prepare] vision bundle: {} ({} shards, {:.1} GB); point vision_encoder.py --model at it",
+            b.dest.display(),
+            b.shards.len(),
+            b.bytes as f64 / 1e9
+        ),
+        Err(e) => eprintln!("[dsw-prepare] WARN: no vision bundle: {e}"),
+    }
 }
 
 /// The checkpoint, downloaded or repaired when it is not already here. `hf` is

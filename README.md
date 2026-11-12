@@ -148,7 +148,7 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 **In a container (one command).** `./start.sh` builds the image from [Dockerfile](Dockerfile) (engine + front-end,
 `sm_121a`), starts `engine/server/service.sh` inside a host-networked GPU container and waits until the API answers;
 `./stop.sh` stops it and frees the GPU. Settings come from `.env` (see [.env.example](.env.example)): `TP`, `FLEET`,
-`WORKERS`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`.
+`WORKERS`, `DSGB10_PORT`, `DSGB10_ENGINE_ARGS`, `DSGB10_FRONT_ARGS`, `DSGB10_RING_DIRECT`, `VISION`.
 
 ```bash
 cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, port
@@ -169,6 +169,16 @@ is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or 
 `.dsw` and its Engram shards into `~/dsgb10/convert`, verifies every tensor against the checkpoint, writes the hash map
 and copies the `tokenizer.json` beside the artefacts. `start` needs those artefacts plus that tokenizer — not the
 checkpoint — so it never downloads anything by itself.
+
+Where the bytes come from is chosen automatically: a checkpoint that is already complete and opens is used in place; otherwise
+`dsw-prepare` downloads through the hybrid source — each ordinary shard whole, one at a time, deleted after it is converted, and
+the two 101.5 GB Engram shards by range, so they never touch the disk. `--source local|http|hybrid` forces one.
+
+**Images.** `VISION=1` saves the encoder's slice of the checkpoint (~2.3 GB: the publisher's `inference/` scripts, a trimmed
+index, and the shards holding `vision.`/`aligner.`/`image_` tensors) into `~/dsgb10/vision`, so the rest of the checkpoint can be
+released and vision still works. It also points dsfront at `127.0.0.1:18950`; `VISION_IMAGE=<image with torch + PIL + safetensors>`
+makes `start.sh` run `tools/vision/vision_encoder.py` from that bundle. `VISION=0` (the default) refuses image parts, as before.
+Enabling it later costs at most a re-download of those 2.3 GB, never the 510 GB checkpoint.
 
 Outputs an earlier run left behind are never overwritten silently: `prepare` lists them and asks on the terminal
 (`--replace` answers for a script); answering no stops the run. The space it needs is computed from the plan, not from

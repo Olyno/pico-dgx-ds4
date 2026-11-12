@@ -50,6 +50,13 @@ pub trait Reader {
         Ok(())
     }
 
+    /// The path of this reader's own copy of `shard`, when it has one: what the
+    /// vision bundle copies and what `--consume` releases.
+    fn local_path(&self, shard: usize) -> Option<PathBuf> {
+        let _ = shard;
+        None
+    }
+
     /// Drops what `prepare` left on disk.
     fn finish(&self, shard: usize) {
         let _ = shard;
@@ -59,11 +66,15 @@ pub trait Reader {
 /// Every shard on disk: the plain local case, and the one `--consume` frees.
 pub struct LocalReader {
     shards: Vec<LocalFile>,
+    paths: Vec<PathBuf>,
 }
 
 impl LocalReader {
     pub fn open(paths: &[PathBuf]) -> io::Result<LocalReader> {
-        Ok(LocalReader { shards: paths.iter().map(|p| LocalFile::open(p)).collect::<io::Result<_>>()? })
+        Ok(LocalReader {
+            shards: paths.iter().map(|p| LocalFile::open(p)).collect::<io::Result<_>>()?,
+            paths: paths.to_vec(),
+        })
     }
 }
 
@@ -78,6 +89,10 @@ impl Reader for LocalReader {
 
     fn truncate(&self, shard: usize, len: u64) -> io::Result<()> {
         self.shards[shard].truncate_tail(len)
+    }
+
+    fn local_path(&self, shard: usize) -> Option<PathBuf> {
+        Some(self.paths[shard].clone())
     }
 }
 
@@ -170,6 +185,14 @@ impl Reader for HybridReader {
         match &*c {
             Some((s, _, local)) if *s == shard => local.truncate_tail(len),
             _ => Ok(()),
+        }
+    }
+
+    fn local_path(&self, shard: usize) -> Option<PathBuf> {
+        let c = self.cached.lock().unwrap();
+        match &*c {
+            Some((s, path, _)) if *s == shard => Some(path.clone()),
+            _ => None,
         }
     }
 

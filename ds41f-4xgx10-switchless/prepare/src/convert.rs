@@ -42,6 +42,10 @@ pub struct Options {
     pub resume: bool,
     /// Also write the Engram shards.
     pub engram: bool,
+    /// Where to save the vision encoder's slice of the checkpoint, when it is
+    /// wanted. Written before the conversion, so releasing the checkpoint cannot
+    /// cost it; `run` itself does not read this.
+    pub vision: Option<PathBuf>,
     pub model: String,
 }
 
@@ -56,6 +60,7 @@ impl Default for Options {
             verify: true,
             resume: true,
             engram: true,
+            vision: None,
             model: "deepseek-v4.1-flash".into(),
         }
     }
