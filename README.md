@@ -188,7 +188,8 @@ Extra arguments go to `dsw-prepare`:
 
 | argument | what it does |
 |---|---|
-| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run. The space it needs is the run's **peak** — one shard's outputs, not the whole set — and the checkpoint cannot be kept afterwards |
+| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run. The space it needs is the run's **peak** — one shard's outputs, not the whole set — and the checkpoint cannot be kept afterwards (its payload is gone, while the headers and the blocks at every tensor's edges stay, so it can still be opened and a killed run resumed) |
+| `--clear` (or `./start.sh clear`) | deletes every output an earlier run left in the destination — rank files, `.part` writes, journals, the Engram shards and the hybrid scratch — and nothing else; with `prepare` it then converts. It never touches the checkpoint |
 | `--source http` | streams the checkpoint through HTTP ranges instead of storing it (only the batch in flight is on disk) |
 | `--source hybrid` | downloads each ordinary shard (7.4 GB) whole into `scratch/`, converts it, deletes it, and reads the two 101.5 GB Engram shards by range; one shard of extra peak instead of ~96,000 range requests |
 | `--dest R=DIR` | writes rank R straight into a mounted directory (a worker's disk over NFS), instead of staging and copying |
@@ -196,9 +197,11 @@ Extra arguments go to `dsw-prepare`:
 | `--no-verify` | skips the read-back comparison (faster, and it removes the guarantee) |
 
 Every batch is journaled (`rank<r>.dsw.journal`) after its outputs are written, verified and synced, so an interrupted
-run resumes where it stopped and a crash cannot leave a tensor committed but unreadable. `dsw-prepare status --out DIR`
-prints each rank's progress, and `dsw-prepare verify --ckpt DIR --file FILE` re-derives every tensor from the TOC's own
-description and compares it with the checkpoint.
+run resumes where it stopped and a crash cannot leave a tensor committed but unreadable. Re-running the same command
+keeps those files and continues (`--no-resume` starts over; `--clear` deletes them first). The run prints a line per rank
+per shard — tensors done, bytes written, bytes released, elapsed and an estimate — and the Engram tables report every
+10 %. `dsw-prepare status --out DIR` prints each rank's commits, and `dsw-prepare verify --ckpt DIR --file FILE`
+re-derives every tensor from the TOC's own description and compares it with the checkpoint.
 
 The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
 work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.

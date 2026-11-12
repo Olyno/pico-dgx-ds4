@@ -368,7 +368,20 @@ pub fn run(ck: &Checkpoint, reader: &dyn Reader, o: &Options, source_note: &str)
         }
     }
 
-    for &shard in &order {
+    let started = std::time::Instant::now();
+    let totals: Vec<u64> = states.iter().map(|s| s.plan.tensors.iter().map(|t| t.bytes).sum()).collect();
+    let mut released: u64 = 0;
+    let mut warned_release = false;
+    println!(
+        "[dsw-prepare] converting {} rank(s): {} tensors and {:.1} GB each, {} shard(s), {}",
+        states.len(),
+        states[0].plan.tensors.len(),
+        totals[0] as f64 / 1e9,
+        order.len(),
+        if o.consume { "the sources are released as they are consumed" } else { "the checkpoint is kept" }
+    );
+
+    for (step, &shard) in order.iter().enumerate() {
         reader.prepare(shard).map_err(|e| format!("{}: prepare: {e}", ck.shards[shard].name))?;
         // The scratch copy a hybrid reader fetched goes away even if this shard
         // fails, so a retry starts from a known state.
@@ -432,23 +445,65 @@ pub fn run(ck: &Checkpoint, reader: &dyn Reader, o: &Options, source_note: &str)
         }
 
         // 3. Everything in this shard is committed for every rank: release it.
-        //    Hole punching keeps the offsets; a filesystem without it gets the
-        //    whole shard truncated, which is only safe because nothing in it is
-        //    read again.
+        //    The punch is aligned *inwards*, so it only ever covers whole blocks
+        //    the tensor owns: the shard's own header (the safetensors JSON the
+        //    checkpoint is re-opened from) and the bytes it shares with a
+        //    neighbour stay intact, which is what makes a resume possible.
         if o.consume && fully_consumed(ck, shard, &tables, &states) {
+            let mut freed_here = 0u64;
             for &ti in &ck.shards[shard].tensors {
                 let t = &ck.tensors[ti];
-                let start = t.offset / ALIGN * ALIGN;
-                let end = align_up(t.offset + t.bytes, ALIGN);
+                let start = align_up(t.offset, ALIGN);
+                let end = (t.offset + t.bytes) / ALIGN * ALIGN;
+                if end <= start {
+                    continue;
+                }
                 match reader.release(shard, start, end - start) {
-                    Ok(()) => {}
+                    Ok(()) => freed_here += end - start,
                     Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                        reader.truncate(shard, 0).map_err(|e| format!("{}: release: {e}", t.name))?;
+                        // No hole punching here: keep the checkpoint rather than
+                        // truncate a file the next run has to open.
+                        if !warned_release {
+                            warned_release = true;
+                            eprintln!(
+                                "[dsw-prepare] WARN: {} cannot free blocks ({e}); the checkpoint is kept whole",
+                                ck.shards[shard].path.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
+                            );
+                        }
                         break;
                     }
                     Err(e) => return Err(format!("{}: release: {e}", t.name)),
                 }
             }
+            released += freed_here;
+        }
+
+        // Progress, once a shard: what each rank has committed, how much is on
+        // disk, and how long the rest should take at the pace so far.
+        let elapsed = started.elapsed();
+        for (i, st) in states.iter().enumerate() {
+            let done = st.committed.iter().filter(|n| !n.starts_with("engram:")).count();
+            let written: u64 =
+                st.plan.tensors.iter().filter(|t| st.committed.contains(&t.name)).map(|t| t.bytes).sum();
+            let total = totals[i].max(1);
+            let eta = if written > 0 && written < total {
+                hhmmss(elapsed.mul_f64((total - written) as f64 / written as f64))
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "[{}/{}] rank {}: {}/{} tensors ({}%), {:.1}/{:.1} GB written{}{}, eta {eta}",
+                step + 1,
+                order.len(),
+                st.rank,
+                done,
+                st.plan.tensors.len(),
+                written * 100 / total,
+                written as f64 / 1e9,
+                total as f64 / 1e9,
+                if o.consume { format!(", {:.1} GB released", released as f64 / 1e9) } else { String::new() },
+                format!(", {}", hhmmss(elapsed)),
+            );
         }
     }
 
@@ -461,6 +516,16 @@ pub fn run(ck: &Checkpoint, reader: &dyn Reader, o: &Options, source_note: &str)
         println!("rank {}: {} ({} tensors, {:.1} GB)", st.rank, out.display(), st.plan.tensors.len(), bytes as f64 / 1e9);
     }
     Ok(())
+}
+
+/// `m:ss`, or `h:mm:ss` past an hour.
+fn hhmmss(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s % 3600 / 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
 }
 
 /// Runs `finish` on the reader whatever happens to the shard.
@@ -508,6 +573,7 @@ fn write_engram(ck: &Checkpoint, st: &mut RankState, table: &Table, reader: &dyn
     f.write_all_at(&engram::header(table.layer, lo, hi, table.rows), 0).map_err(|e| e.to_string())?;
     let chunk_rows = ((64u64 << 20) / engram::ROW_BYTES).max(1);
     let mut row = lo;
+    let mut last_pct = 0u64;
     while row < hi {
         let n = (hi - row).min(chunk_rows);
         let mut weight = vec![0u8; (n * engram::WEIGHT_BYTES) as usize];
@@ -539,6 +605,13 @@ fn write_engram(ck: &Checkpoint, st: &mut RankState, table: &Table, reader: &dyn
             }
         }
         row += n;
+        // The tables are the long pole: a line every 10 %, which is minutes apart
+        // on the real 95 GB shards.
+        let pct = (row - lo) * 100 / (hi - lo).max(1);
+        if pct >= last_pct + 10 {
+            last_pct = pct;
+            println!("  rank {}: Engram layer {} {pct}% ({} rows)", st.rank, table.layer, row - lo);
+        }
     }
     f.sync_all().map_err(|e| e.to_string())?;
     std::fs::rename(&tmp, &path).map_err(|e| format!("{}: {e}", path.display()))?;

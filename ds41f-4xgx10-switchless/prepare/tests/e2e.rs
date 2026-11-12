@@ -50,6 +50,8 @@ fn write_checkpoint(dir: &Path) {
             ("layers.0.attn_norm.weight", "BF16", &[8], &pattern(16, 2)),
             ("layers.0.attn.wq_b.weight", "F8_E4M3", &[64, 64], &pattern(4096, 3)),
             ("layers.0.attn.wo_b.weight", "F8_E4M3", &[64, 256], &pattern(16384, 4)),
+            // 2 MiB: the one tensor here whose blocks are worth reclaiming.
+            ("layers.0.ffn.shared_experts.w1.weight", "F8_E4M3", &[4096, 512], &pattern(2 << 20, 20)),
             ("layers.0.attn.wo_b.scale", "F8_E8M0", &[2, 8], &pattern(16, 5)),
             ("layers.0.ffn.experts.0.w1.weight", "I8", &[64, 64], &pattern(4096, 6)),
             ("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[64, 4], &pattern(256, 14)),
@@ -78,6 +80,7 @@ fn write_checkpoint(dir: &Path) {
         "layers.0.attn.wq_b.weight": "model-00001-of-00002.safetensors",
         "layers.0.attn.wo_b.weight": "model-00001-of-00002.safetensors",
         "layers.0.attn.wo_b.scale": "model-00001-of-00002.safetensors",
+        "layers.0.ffn.shared_experts.w1.weight": "model-00001-of-00002.safetensors",
         "layers.0.ffn.experts.0.w1.weight": "model-00001-of-00002.safetensors",
         "layers.0.ffn.experts.0.w1.scale": "model-00001-of-00002.safetensors",
         "layers.0.ffn.experts.0.w2.weight": "model-00001-of-00002.safetensors",
@@ -152,9 +155,9 @@ fn converts_all_ranks_and_every_output_verifies() {
         assert_eq!(hb.rank, r);
         assert_eq!(hb.world, 4);
         assert_eq!(&hb.magic, b"DSGB10W1");
-        // embed, attn_norm, wq_b, wo_b (+scale), the stacked experts w1/w2 (+their
-        // scales), engram.wkv (+scale)
-        assert_eq!(hb.n_tensors, 11);
+        // embed, attn_norm, wq_b, wo_b (+scale), the shared expert, the stacked
+        // experts w1/w2 (+their scales), engram.wkv (+scale)
+        assert_eq!(hb.n_tensors, 12);
         assert_eq!(hb.file_bytes, f.metadata().unwrap().len());
         convert::verify_file(&ck, &f).unwrap_or_else(|e| panic!("rank {r}: {e}"));
 
@@ -249,6 +252,12 @@ fn consume_releases_the_source_and_the_outputs_still_match() {
     // The headers stay (a few blocks); the tensor payload must be gone.
     let (b0, a0) = (before.iter().sum::<u64>(), after.iter().sum::<u64>());
     assert!(a0 * 10 < b0, "the source was not released: {before:?} -> {after:?}");
+
+    // The checkpoint must stay openable after a consuming run: its headers and the
+    // blocks around every tensor's edges are untouched, which is what lets an
+    // interrupted run be resumed.
+    let again = Checkpoint::open(&work).unwrap();
+    assert_eq!(again.tensors.len(), ck.tensors.len());
 
     // The outputs are checked against an untouched copy of the checkpoint.
     let clean = Checkpoint::open(&pristine).unwrap();

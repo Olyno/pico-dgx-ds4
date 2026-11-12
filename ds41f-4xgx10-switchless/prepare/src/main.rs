@@ -90,13 +90,15 @@ fn admit(out: &Path, need: u64, free: u64, consume: bool, peak: Option<u64>) -> 
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dsw-prepare <prepare|verify|plan|status> [options]\n\
+        "usage: dsw-prepare <prepare|verify|plan|clear|status> [options]\n\
          \n\
          prepare  --ckpt DIR  --out DIR  [--world N] [--ranks LIST] [--source local|http]\n\
-         \x20        [--consume] [--replace] [--no-verify] [--no-resume] [--no-engram]\n\
+         \x20        [--consume] [--clear] [--no-verify] [--no-resume] [--no-engram]\n\
          \x20        [--dest R=DIR]... [--repo OWNER/NAME] [--rev SHA] [--endpoint URL]\n\
          verify   --ckpt DIR --file FILE\n\
          plan     [--ckpt DIR] [--world N] [--rank R]\n\
+         clear    [--out DIR]   delete the rank files, journals, Engram shards and\n\
+         \x20                     scratch of earlier runs (never the checkpoint)\n\
          status   [--out DIR]"
     );
     std::process::exit(2);
@@ -125,6 +127,7 @@ fn main() {
     let mut source = "auto".to_string();
     let mut consume = false;
     let mut replace = false;
+    let mut clear = false;
     let mut verify = true;
     let mut resume = true;
     let mut engram = true;
@@ -167,6 +170,7 @@ fn main() {
             }
             "--consume" => consume = true,
             "--replace" => replace = true,
+            "--clear" | "--reset" => clear = true,
             "--no-verify" => verify = false,
             "--no-resume" => resume = false,
             "--no-engram" => engram = false,
@@ -206,7 +210,7 @@ fn main() {
                 vision: vision.then(|| vision_dir.clone()),
                 model: "deepseek-v4.1-flash".into(),
             };
-            prepare(&ckpt, &o, &source, &repo, &rev, &endpoint, replace);
+            prepare(&ckpt, &o, &source, &repo, &rev, &endpoint, replace, clear);
         }
         "verify" => {
             let f = file.unwrap_or_else(|| die("verify needs --file"));
@@ -269,12 +273,23 @@ fn main() {
             plan::check_coverage(&ck, world).unwrap_or_else(|e| die(&e));
             println!("coverage: every tensor is whole on every rank or cut into disjoint, complete pieces");
         }
+        "clear" => {
+            let (items, freed) = clear_outputs(&out).unwrap_or_else(|e| die(&e));
+            if items == 0 {
+                println!("[dsw-prepare] nothing to clear in {}", out.display());
+            } else {
+                println!(
+                    "[dsw-prepare] {items} item(s) of earlier runs deleted, {:.1} GB freed (the checkpoint is untouched)",
+                    freed as f64 / 1e9
+                );
+            }
+        }
         "status" => status(&out, world),
         _ => usage(),
     }
 }
 
-fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoint: &str, replace: bool) {
+fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoint: &str, replace: bool, clear: bool) {
     // The local checkpoint wins whenever it is already complete; a download goes
     // through the hybrid source, which keeps one shard on disk at a time.
     let source: &str = if source == "auto" {
@@ -332,14 +347,39 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
         }
     }
 
-    let existing = existing_outputs(o);
+    // An interrupted run leaves its journal and its `.part` behind. Those are the
+    // resume state, not stale output, so they are kept and the run continues where
+    // it stopped; only what cannot be resumed is offered for deletion.
+    let existing = if clear {
+        let (items, freed) = clear_outputs(&o.out).unwrap_or_else(|e| die(&e));
+        println!(
+            "[dsw-prepare] --clear: {items} item(s) of earlier runs deleted, {:.1} GB freed (the checkpoint is untouched)",
+            freed as f64 / 1e9
+        );
+        Vec::new()
+    } else {
+        existing_outputs(o)
+    };
     if !existing.is_empty() {
-        confirm_replace(&existing, replace);
-        for p in &existing {
-            if p.is_dir() {
-                let _ = std::fs::remove_dir_all(p);
-            } else {
-                let _ = std::fs::remove_file(p);
+        let (keep, stale): (Vec<PathBuf>, Vec<PathBuf>) = if o.resume {
+            existing.into_iter().partition(|p| resumable(o, p))
+        } else {
+            (Vec::new(), existing)
+        };
+        if !keep.is_empty() {
+            println!(
+                "[dsw-prepare] resuming: keeping {} file(s) from an interrupted run (--no-resume starts over)",
+                keep.len()
+            );
+        }
+        if !stale.is_empty() {
+            confirm_replace(&stale, replace);
+            for p in &stale {
+                if p.is_dir() {
+                    let _ = std::fs::remove_dir_all(p);
+                } else {
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
     }
@@ -367,6 +407,16 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
     } else {
         None
     };
+    if o.consume {
+        if let Some(p) = peak {
+            println!(
+                "[dsw-prepare] --consume: {:.1} GB free, peak {:.1} GB (one shard in flight), {:.1} GB of headroom",
+                free as f64 / 1e9,
+                p as f64 / 1e9,
+                RESERVE as f64 / 1e9
+            );
+        }
+    }
     if let Err(e) = admit(&o.out, need, free, o.consume, peak) {
         die(&e);
     }
@@ -525,6 +575,75 @@ fn existing_outputs(o: &Options) -> Vec<PathBuf> {
     v
 }
 
+/// Every name this tool writes into an output directory: the rank files, their
+/// journals and partial writes, the Engram shards and the hybrid scratch. The
+/// checkpoint lives elsewhere and is never one of them.
+fn owns(name: &str) -> bool {
+    if name == "engram" || name == "scratch" {
+        return true;
+    }
+    let Some(rest) = name.strip_prefix("rank") else { return false };
+    let Some((rank, tail)) = rest.split_once('.') else { return false };
+    rank.parse::<u32>().is_ok() && matches!(tail, "dsw" | "dsw.part" | "dsw.journal" | "dsw.journal.part")
+}
+
+/// Deletes them, and nothing else in the directory.
+fn clear_outputs(out: &Path) -> Result<(usize, u64), String> {
+    let Ok(dir) = std::fs::read_dir(out) else { return Ok((0, 0)) };
+    let (mut items, mut freed) = (0usize, 0u64);
+    for e in dir {
+        let e = e.map_err(|err| format!("{}: {err}", out.display()))?;
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !owns(&name) {
+            continue;
+        }
+        let p = e.path();
+        freed += bytes_of(&p);
+        if p.is_dir() {
+            std::fs::remove_dir_all(&p).map_err(|err| format!("{}: {err}", p.display()))?;
+        } else {
+            std::fs::remove_file(&p).map_err(|err| format!("{}: {err}", p.display()))?;
+        }
+        println!("  removed {}", p.display());
+        items += 1;
+    }
+    Ok((items, freed))
+}
+
+fn bytes_of(p: &Path) -> u64 {
+    if !p.is_dir() {
+        return std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+    }
+    std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| bytes_of(&e.path())).sum()
+}
+
+/// Whether an existing file belongs to an unfinished run that the journal can
+/// continue: `rank<r>.(dsw|journal)[.part]` whose journal exists and is not done,
+/// or the Engram directory beside such a journal.
+fn resumable(o: &Options, p: &Path) -> bool {
+    if p.is_dir() {
+        return o.ranks.iter().any(|&r| journal_running(o, r));
+    }
+    let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let Some(rest) = name.strip_prefix("rank") else { return false };
+    match rest.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
+        Some(r) => journal_running(o, r),
+        None => false,
+    }
+}
+
+fn journal_running(o: &Options, rank: u32) -> bool {
+    let j = convert::journal_path(o, rank);
+    if !j.exists() {
+        return false;
+    }
+    match dsw_prepare::journal::Journal::load(&j) {
+        Ok((_records, state)) => !state.done,
+        // Unreadable is not resumable, and the next run would refuse it anyway.
+        Err(_) => false,
+    }
+}
+
 /// The interactive confirmation the prepare command always asks before it
 /// deletes anything. A non-interactive run refuses instead of guessing.
 fn confirm_replace(paths: &[PathBuf], replace: bool) {
@@ -618,6 +737,75 @@ mod tests {
     use super::*;
 
     const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn clear_takes_only_what_the_tool_wrote() {
+        let dir = std::env::temp_dir().join(format!("dsw-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("engram")).unwrap();
+        std::fs::create_dir_all(dir.join("scratch")).unwrap();
+        for (rel, bytes) in [
+            ("rank0.dsw", 100),
+            ("rank0.dsw.part", 50),
+            ("rank0.dsw.journal", 20),
+            ("rank3.dsw", 10),
+            ("engram/engram-l1-r0of4.bin", 7),
+            ("scratch/model-00001.safetensors", 3),
+            ("notes.txt", 5),
+            ("model.safetensors", 9),
+        ] {
+            std::fs::write(dir.join(rel), vec![0u8; bytes]).unwrap();
+        }
+        let (items, freed) = clear_outputs(&dir).unwrap();
+        assert_eq!(items, 6, "rank0 x3, rank3, engram/, scratch/");
+        assert_eq!(freed, 100 + 50 + 20 + 10 + 7 + 3);
+        for gone in ["rank0.dsw", "rank0.dsw.part", "rank0.dsw.journal", "rank3.dsw", "engram", "scratch"] {
+            assert!(!dir.join(gone).exists(), "{gone} should be gone");
+        }
+        for kept in ["notes.txt", "model.safetensors"] {
+            assert!(dir.join(kept).exists(), "{kept} is not ours and must stay");
+        }
+        assert_eq!(clear_outputs(&dir).unwrap(), (0, 0), "a second clear finds nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unfinished_run_is_resumed_not_deleted() {
+        use dsw_prepare::journal::{Journal, Record, VERSION};
+        let dir = std::env::temp_dir().join(format!("dsw-resume-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let o = Options { ranks: vec![0], out: dir.clone(), ..Options::default() };
+        let j = convert::journal_path(&o, 0);
+        let dsw = convert::dsw_path(&o, 0);
+        // Nothing was written yet: nothing to resume.
+        assert!(!resumable(&o, &j));
+        assert!(!resumable(&o, &dsw));
+
+        let mut jr = Journal::create(&j).unwrap();
+        jr.append(&Record::Begin {
+            version: VERSION,
+            fingerprint: "plan".into(),
+            rank: 0,
+            world: 4,
+            out: dir.display().to_string(),
+        })
+        .unwrap();
+        // A begun journal, the half-written file and the Engram directory are the
+        // state the next run continues from.
+        assert!(resumable(&o, &j));
+        let mut part = dsw.clone().into_os_string();
+        part.push(".part");
+        assert!(resumable(&o, Path::new(&part)));
+        std::fs::create_dir_all(dir.join("engram")).unwrap();
+        assert!(resumable(&o, &dir.join("engram")));
+
+        // A finished journal is ordinary output, not resume state.
+        jr.append(&Record::Done { file: dsw.display().to_string(), bytes: 1, tensors: 1 }).unwrap();
+        assert!(!resumable(&o, &j));
+        assert!(!resumable(&o, &dir.join("engram")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn the_whole_set_must_fit_without_consumption() {

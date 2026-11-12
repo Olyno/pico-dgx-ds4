@@ -17,6 +17,9 @@
 #                              --source hybrid caches one whole shard at a time, --replace
 #                              skips the "delete these?" prompt, --dest R=DIR writes a rank
 #                              straight to a mounted path
+#   ./start.sh clear           delete the rank files, journals, Engram shards and
+#                              scratch of earlier runs, keeping the checkpoint
+#                              (prepare --clear does the same, then converts)
 #   ./start.sh --help
 #   DRY_RUN=1 ./start.sh       print the docker command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
@@ -90,6 +93,21 @@ ensure_image() {
 # the checkpoint's blocks as the outputs land, --source http streams it instead of
 # storing it, --replace skips the "delete these?" prompt, --dest R=DIR writes a
 # rank straight to a mounted path.
+# ./start.sh clear: the outputs of earlier runs, never the checkpoint. Offline, so
+# it cannot start a download by accident.
+clear_outputs() {
+  local ttyarg=()
+  [ -t 0 ] && ttyarg=(-it)
+  log "clear: deleting the rank files, journals, Engram shards and scratch of earlier runs"
+  if [ "$DRY" = "1" ]; then
+    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root \\"
+    echo "      $IMAGE prepare/target/release/dsw-prepare clear $*"
+    return 0
+  fi
+  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" \
+    "$IMAGE" prepare/target/release/dsw-prepare clear "$@" || die "clear failed"
+}
+
 prepare() {
   local out="$HOME/dsgb10/convert"
   local envarg=()
@@ -147,7 +165,7 @@ start_vision() {
 
 MODE=start
 case "${1:-}" in
-  start | restart | status | fleet | prepare) MODE=$1; shift ;;
+  start | restart | status | fleet | prepare | clear) MODE=$1; shift ;;
   -h | --help | help) usage; exit 0 ;;
 esac
 for arg in "$@"; do
@@ -162,12 +180,15 @@ if [ "$MODE" = "fleet" ]; then
     --out "${FLEET_ENV:-$REPO/fleet.conf}" "$@"
 fi
 
-[ -f "$FLEET" ] || die "fleet file $FLEET not found (./start.sh fleet generates one from TP and WORKERS, or set FLEET=FILE)"
-for ((r = 1; r < TP; r++)); do
-  grep -q "^RANK${r}_SSH=" "$FLEET" || die "fleet file $FLEET has no RANK${r}_SSH (TP=$TP needs ranks 0..$((TP - 1)))"
-done
-if [ "$TP" != "4" ]; then
-  warn "TP=$TP: the engine is TP=4 specialised (engine/common/tp.h). dsw_convert will cut --world $TP files, but dsgb10_rank refuses TP=$TP until the kernels and ring are generalised."
+# A clear only deletes files: no fleet, no GPU.
+if [ "$MODE" != "clear" ]; then
+  [ -f "$FLEET" ] || die "fleet file $FLEET not found (./start.sh fleet generates one from TP and WORKERS, or set FLEET=FILE)"
+  for ((r = 1; r < TP; r++)); do
+    grep -q "^RANK${r}_SSH=" "$FLEET" || die "fleet file $FLEET has no RANK${r}_SSH (TP=$TP needs ranks 0..$((TP - 1)))"
+  done
+  if [ "$TP" != "4" ]; then
+    warn "TP=$TP: the engine is TP=4 specialised (engine/common/tp.h). prepare cuts --world $TP files, but dsgb10_rank refuses TP=$TP until the kernels and ring are generalised."
+  fi
 fi
 
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; }
@@ -183,6 +204,10 @@ fi
 ensure_image
 if [ "$MODE" = "prepare" ]; then
   prepare "$@"
+  exit 0
+fi
+if [ "$MODE" = "clear" ]; then
+  clear_outputs "$@"
   exit 0
 fi
 
