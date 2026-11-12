@@ -97,15 +97,17 @@ prepare() {
   local ckpt_in out_in
   ckpt_in=$(in_container "$ckpt") out_in=$(in_container "$out")
 
-  # Xet's writer thread is what fails on some bind mounts ("Background writer
-  # channel closed"); the plain HTTP path is slower and reliable. HF_XET=1 re-enables it.
-  local xet=${HF_HUB_DISABLE_XET:-1}
-  [ -n "${HF_XET:-}" ] && xet=0
+  # The checkpoint's shards are Xet-backed and refuse the classic path ("the file
+  # is too large to be downloaded using the regular download method"), so xet
+  # stays on: its "Background writer channel closed" was a full disk, not xet.
+  # HF_NO_XET=1 forces the classic path (small repos only).
+  local xetarg=()
+  [ -n "${HF_NO_XET:-}" ] && xetarg=(-e HF_HUB_DISABLE_XET=1)
   prep_exec() {  # what; shell in the image
     log "$1"
     [ "$DRY" = "1" ] && { echo "    $2"; return 0; }
     docker run --rm --gpus all --ipc=host --network host -v "$HOME:/root" -v /data:/data \
-      -e "HF_HUB_DISABLE_XET=$xet" ${HF_TOKEN:+-e HF_TOKEN} \
+      "${xetarg[@]}" ${HF_TOKEN:+-e HF_TOKEN} \
       "$IMAGE" bash -lc "cd /work/ds41f-4xgx10-switchless && $2" ||
       die "prepare: '$1' failed"
   }
@@ -136,7 +138,7 @@ prepare() {
     fi
     # hf (huggingface_hub >= 0.27) or the older CLI, chosen once: a `||` chain
     # would mask a failed download as "command not found".
-    prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable, xet off)" \
+    prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable)" \
       "if command -v hf >/dev/null 2>&1; then hf download $repo --revision $rev --local-dir $ckpt_in; else huggingface-cli download $repo --revision $rev --local-dir $ckpt_in; fi"
   fi
   for ((r = 0; r < TP; r++)); do
