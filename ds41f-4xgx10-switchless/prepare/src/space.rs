@@ -64,6 +64,59 @@ pub fn truncate_tail(f: &File, off: u64) -> io::Result<()> {
     f.set_len(off)
 }
 
+/// The peak bytes that must be free during a `--consume` run, in the same
+/// filesystem as the checkpoint: outputs are written shard by shard, and a
+/// shard's blocks are released only once every tensor that reads it is committed
+/// (a tensor is written at the last shard its sources occupy). What has to fit is
+/// therefore the high-water mark of `written - released`, not the total.
+pub fn consume_peak(ck: &crate::safetensors::Checkpoint, world: u32, ranks: &[u32], engram: bool) -> Result<u64, String> {
+    let n = ck.shards.len();
+    let mut written_at = vec![0u64; n];
+    let mut released_at = vec![0usize; n];
+    for &r in ranks {
+        let p = crate::plan::make_plan(ck, r, world).map_err(|e| format!("rank {r}: {e}"))?;
+        for t in &p.tensors {
+            let last = t.pieces.iter().map(|pc| ck.tensors[pc.src].shard).max().unwrap_or(0);
+            written_at[last] = written_at[last].saturating_add(t.bytes);
+            for pc in &t.pieces {
+                let s = ck.tensors[pc.src].shard;
+                released_at[s] = released_at[s].max(last);
+            }
+        }
+    }
+    // An Engram table is written when its weight's shard is processed, and that
+    // shard can only be released afterwards.
+    if engram {
+        for t in crate::engram::tables(ck)? {
+            let s = ck.tensors[t.weight].shard;
+            for &r in ranks {
+                written_at[s] = written_at[s].saturating_add(crate::engram::shard_bytes(&t, r));
+            }
+            released_at[s] = released_at[s].max(s);
+        }
+    }
+    let sizes: Vec<u64> = ck.shards.iter().map(|s| s.size).collect();
+    Ok(simulate(&sizes, &written_at, &released_at))
+}
+
+/// The high-water mark of `written - released` in shard order. A shard's outputs
+/// are written before the shards they finish are released, so the peak is taken
+/// between the two, and a step that frees more than it writes cannot go below
+/// zero (the space was already free).
+fn simulate(sizes: &[u64], written_at: &[u64], released_at: &[usize]) -> u64 {
+    let mut freed_at = vec![0u64; sizes.len()];
+    for (s, &at) in released_at.iter().enumerate() {
+        freed_at[at] = freed_at[at].saturating_add(sizes[s]);
+    }
+    let (mut written, mut freed, mut peak) = (0u64, 0u64, 0u64);
+    for k in 0..sizes.len() {
+        written = written.saturating_add(written_at.get(k).copied().unwrap_or(0));
+        peak = peak.max(written.saturating_sub(freed));
+        freed = freed.saturating_add(freed_at[k]);
+    }
+    peak
+}
+
 /// Admission for one output directory: never plan to write more than the disk can
 /// hold alongside the reserve the run must keep free.
 #[derive(Debug, Clone)]
@@ -139,6 +192,79 @@ mod tests {
         truncate_tail(&f, 4096).unwrap();
         assert_eq!(f.metadata().unwrap().len(), 4096);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A two-shard checkpoint: `(shard, name, dtype, shape)` per tensor.
+    fn checkpoint(tensors: &[(usize, &str, &str, &[u64])]) -> (std::path::PathBuf, crate::safetensors::Checkpoint) {
+        use crate::safetensors::tests::write_shard;
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("dsw-space-ck-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for shard in 0..2 {
+            let items: Vec<(&str, &str, &[u64], Vec<u8>)> = tensors
+                .iter()
+                .filter(|(s, ..)| *s == shard)
+                .map(|(_, name, dtype, shape)| {
+                    let bytes: u64 = shape.iter().product::<u64>() * crate::dsw::DType::from_safetensors(dtype).unwrap().bytes();
+                    (*name, *dtype, *shape, vec![0u8; bytes as usize])
+                })
+                .collect();
+            let refs: Vec<(&str, &str, &[u64], &[u8])> =
+                items.iter().map(|(n, d, s, b)| (*n, *d, *s, b.as_slice())).collect();
+            write_shard(&dir.join(format!("model-0000{}-of-00002.safetensors", shard + 1)), &refs);
+        }
+        let ck = crate::safetensors::Checkpoint::open(&dir).unwrap();
+        (dir, ck)
+    }
+
+    #[test]
+    fn consuming_peaks_at_one_shards_outputs() {
+        let (dir, ck) = checkpoint(&[
+            (0, "layers.0.attn.wq_b.weight", "F8_E4M3", &[2048, 64]),
+            (1, "layers.1.attn.wq_b.weight", "F8_E4M3", &[2048, 64]),
+        ]);
+        let ranks = [0u32, 1, 2, 3];
+        // Four ranks of 512 rows x 64 bytes, written when shard 0 is processed, and
+        // shard 0 is released in the same step: the peak is one shard's worth.
+        let peak = consume_peak(&ck, 4, &ranks, false).unwrap();
+        assert_eq!(peak, 4 * 512 * 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_tensor_spanning_two_shards_cannot_be_released_early() {
+        // The two experts stack into one tensor, so nothing is released until the
+        // last of the two shards has been read: the peak is the whole set.
+        let (dir, ck) = checkpoint(&[
+            (0, "layers.0.ffn.experts.0.w1.weight", "I8", &[64, 64]),
+            (1, "layers.0.ffn.experts.1.w1.weight", "I8", &[64, 64]),
+        ]);
+        let ranks = [0u32, 1, 2, 3];
+        let peak = consume_peak(&ck, 4, &ranks, false).unwrap();
+        assert_eq!(peak, 4 * 2 * 16 * 64);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_peak_does_not_accumulate_across_shards() {
+        // The real shape at TP=2: 46 shards of 7.4 GB whose rank files are 6.7 GB,
+        // then the two 101.5 GB Engram shards whose shards are 50.7 GB. Written is
+        // 409 GB in total, but every ordinary shard frees more than it writes, so
+        // what has to be free is one Engram shard's output, not the sum.
+        let ordinary = 7_400_000_000u64;
+        let written = 6_700_000_000u64;
+        let engram = 101_500_000_000u64;
+        let engram_out = 50_700_000_000u64;
+        let sizes: Vec<u64> = (0..46).map(|_| ordinary).chain([engram, engram]).collect();
+        let written_at: Vec<u64> = (0..46).map(|_| written).chain([engram_out, engram_out]).collect();
+        let released: Vec<usize> = (0..48).collect();
+        let peak = simulate(&sizes, &written_at, &released);
+        // Written so far (46 x 6.7 GB + one Engram shard) minus what those 46
+        // shards already released (46 x 7.4 GB).
+        assert_eq!(peak, 308_200_000_000u64 + engram_out - 340_400_000_000u64);
+        assert!(peak < 20_000_000_000, "the peak is one Engram shard's output, not 409 GB: {peak}");
     }
 
     #[test]

@@ -33,8 +33,59 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
+/// The device a path lives on; missing components are followed up to an ancestor,
+/// as the space check does.
+fn device_of(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    let mut p = path;
+    loop {
+        if let Ok(m) = std::fs::metadata(p) {
+            return Some(m.dev());
+        }
+        p = p.parent()?;
+    }
+}
+
+/// Whether freeing the checkpoint's blocks would free space where the outputs go.
+fn same_filesystem(a: &Path, b: &Path) -> bool {
+    matches!((device_of(a), device_of(b)), (Some(x), Some(y)) if x == y)
+}
+
 fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
+}
+
+/// Whether the run may start, and why not when it may not. `peak` is what a
+/// consuming run would need at its high-water mark; without it, or without
+/// `--consume`, the whole output set has to fit.
+fn admit(out: &Path, need: u64, free: u64, consume: bool, peak: Option<u64>) -> Result<(), String> {
+    let fits = match (consume, peak) {
+        (true, Some(p)) => p + RESERVE <= free,
+        _ => need + RESERVE <= free,
+    };
+    if fits {
+        return Ok(());
+    }
+    let mut msg = format!(
+        "{} has {:.1} GB free and this run writes {:.1} GB, then keeps {:.1} GB of headroom",
+        out.display(),
+        free as f64 / 1e9,
+        need as f64 / 1e9,
+        RESERVE as f64 / 1e9
+    );
+    match peak {
+        Some(p) if !consume && p + RESERVE <= free => msg.push_str(&format!(
+            ". --consume fits: it converts one shard at a time and frees each once its outputs are verified, so the peak is {:.1} GB — the checkpoint cannot be kept afterwards",
+            p as f64 / 1e9
+        )),
+        Some(p) => msg.push_str(&format!(
+            ". --consume would peak at {:.1} GB, which does not fit either",
+            p as f64 / 1e9
+        )),
+        None => {}
+    }
+    msg.push_str("; --dest writes a rank to another disk, and --source hybrid keeps only one shard on this one");
+    Err(msg)
 }
 
 fn usage() -> ! {
@@ -297,24 +348,27 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
     if source == "hybrid" {
         need += ck.shards.iter().map(|s| s.size).filter(|&b| b <= HYBRID_MAX_CACHED).max().unwrap_or(0);
     }
-    // The vision bundle is a second copy of the shards the encoder reads.
+    // The vision bundle is a second copy of the shards the encoder reads, written
+    // before anything is released, so it counts against both budgets.
+    let mut always = 0u64;
     if o.vision.is_some() {
-        let v: u64 = dsw_prepare::vision::shards_needed(&ck).iter().map(|&i| ck.shards[i].size).sum();
-        need += v;
+        always = dsw_prepare::vision::shards_needed(&ck).iter().map(|&i| ck.shards[i].size).sum();
+        need += always;
     }
 
-    // Admission: the outputs must fit, plus the reserve. A local source is already
-    // allocated, so it is not added again; --consume only frees it later.
+    // Admission. Without reclamation the whole output set must fit; a local source
+    // is already allocated, so it is not added again. With --consume the checkpoint
+    // is released as each shard's outputs are verified, so what has to fit is the
+    // peak of (written - released) instead — computed whenever that could help,
+    // which needs the outputs on the checkpoint's own filesystem.
     let free = space::free_bytes(&o.out).unwrap_or_else(|e| die(&format!("{}: {e}", o.out.display())));
-    if need + RESERVE > free {
-        die(&format!(
-            "{} has {:.1} GB free; this run writes {:.1} GB and keeps {:.1} GB of headroom. \
-             Use --dest for the other ranks, or --source http with --dest, or a bigger disk",
-            o.out.display(),
-            free as f64 / 1e9,
-            need as f64 / 1e9,
-            RESERVE as f64 / 1e9
-        ));
+    let peak = if o.dest.is_empty() && source == "local" && same_filesystem(ckpt, &o.out) {
+        space::consume_peak(&ck, o.world, &o.ranks, o.engram).ok().map(|p| p + always)
+    } else {
+        None
+    };
+    if let Err(e) = admit(&o.out, need, free, o.consume, peak) {
+        die(&e);
     }
 
     // Before the conversion, so releasing the checkpoint cannot cost the encoder
@@ -556,5 +610,36 @@ fn status(out: &Path, world: u32) {
     }
     if !any {
         println!("no journals under {}", out.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GB: u64 = 1_000_000_000;
+
+    #[test]
+    fn the_whole_set_must_fit_without_consumption() {
+        let out = Path::new("/data/out");
+        assert!(admit(out, 400 * GB, 500 * GB, false, None).is_ok());
+        let e = admit(out, 404 * GB, 100 * GB, false, None).unwrap_err();
+        assert!(e.contains("writes 404.0 GB"), "{e}");
+        assert!(!e.contains("--consume"), "nothing to offer without a peak: {e}");
+    }
+
+    #[test]
+    fn consumption_is_judged_by_its_peak_not_the_total() {
+        let out = Path::new("/data/out");
+        // The report from a two-rank run: 409 GB of files, 95 GB free, and a
+        // consuming peak of one Engram shard's output.
+        let e = admit(out, 409 * GB, 95 * GB, false, Some(19 * GB)).unwrap_err();
+        assert!(e.contains("--consume fits"), "{e}");
+        assert!(e.contains("peak is 19.0 GB"), "{e}");
+        assert!(admit(out, 409 * GB, 95 * GB, true, Some(19 * GB)).is_ok());
+        // A peak that does not fit either is called out as such.
+        let e = admit(out, 409 * GB, 95 * GB, true, Some(300 * GB)).unwrap_err();
+        assert!(e.contains("does not fit either"), "{e}");
+        assert!(e.contains("--dest"), "{e}");
     }
 }

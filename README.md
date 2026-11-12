@@ -188,7 +188,7 @@ Extra arguments go to `dsw-prepare`:
 
 | argument | what it does |
 |---|---|
-| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run |
+| `--consume` | releases the checkpoint's blocks as each output is verified and journaled, so the disk holds one copy, not two; needs every rank and the Engram shards in the same run. The space it needs is the run's **peak** — one shard's outputs, not the whole set — and the checkpoint cannot be kept afterwards |
 | `--source http` | streams the checkpoint through HTTP ranges instead of storing it (only the batch in flight is on disk) |
 | `--source hybrid` | downloads each ordinary shard (7.4 GB) whole into `scratch/`, converts it, deletes it, and reads the two 101.5 GB Engram shards by range; one shard of extra peak instead of ~96,000 range requests |
 | `--dest R=DIR` | writes rank R straight into a mounted directory (a worker's disk over NFS), instead of staging and copying |
