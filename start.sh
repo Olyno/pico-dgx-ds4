@@ -103,13 +103,20 @@ prepare() {
   # HF_NO_XET=1 forces the classic path (small repos only).
   local xetarg=()
   [ -n "${HF_NO_XET:-}" ] && xetarg=(-e HF_HUB_DISABLE_XET=1)
+  # docker run inherits none of this shell's environment: a proxy or a mirror
+  # endpoint set here would be lost and the download would hang at 0 %.
+  local envarg=()
+  for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy \
+    HF_ENDPOINT HF_TOKEN HF_DEBUG HF_HUB_ETAG_TIMEOUT; do
+    [ -n "${!v:-}" ] && envarg+=(-e "$v")
+  done
   prep_exec() {  # what; shell in the image
     log "$1"
     [ "$DRY" = "1" ] && { echo "    $2"; return 0; }
     docker run --rm --gpus all --ipc=host --network host -v "$HOME:/root" -v /data:/data \
-      "${xetarg[@]}" ${HF_TOKEN:+-e HF_TOKEN} \
+      "${xetarg[@]}" "${envarg[@]}" \
       "$IMAGE" bash -lc "cd /work/ds41f-4xgx10-switchless && $2" ||
-      die "prepare: '$1' failed"
+      die "prepare: '$1' failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
   }
 
   # Space, before anything long: the checkpoint (~510 GB, once) plus each rank's
