@@ -112,17 +112,21 @@ prepare() {
 
   if [ "$nodl" = 1 ]; then
     log "prepare: --no-download, using $ckpt"
-  elif [ -f "$ckpt/config.json" ]; then
-    log "prepare: checkpoint present at $ckpt"
   else
-    # The checkpoint is ~510 GB: fail before a long download that cannot finish.
-    local dir free_gb
-    dir=$(dirname "$ckpt")
-    while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir=$(dirname "$dir"); done
-    free_gb=$(df -Pk "$dir" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
-    if [ "${free_gb:-0}" -lt "${NEED_GB:-520}" ]; then
-      [ "$DRY" = "1" ] && warn "DRY_RUN: only ${free_gb:-?} GiB free on $dir (the checkpoint needs ~510)" ||
-        die "only ${free_gb:-?} GiB free on $dir; the checkpoint needs ~510 GiB (NEED_GB=N to override)"
+    if [ -f "$ckpt/config.json" ]; then
+      # A download that ran out of space leaves config.json behind and shards short: the
+      # converter then fails on a tensor count. hf download is idempotent and resumes.
+      log "prepare: checkpoint present at $ckpt: re-checking it (hf download repairs a partial one)"
+    else
+      # The checkpoint is ~510 GB: fail before a long download that cannot finish.
+      local dir free_gb
+      dir=$(dirname "$ckpt")
+      while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir=$(dirname "$dir"); done
+      free_gb=$(df -Pk "$dir" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
+      if [ "${free_gb:-0}" -lt "${NEED_GB:-520}" ]; then
+        [ "$DRY" = "1" ] && warn "DRY_RUN: only ${free_gb:-?} GiB free on $dir (the checkpoint needs ~510)" ||
+          die "only ${free_gb:-?} GiB free on $dir; the checkpoint needs ~510 GiB (NEED_GB=N to override)"
+      fi
     fi
     # hf (huggingface_hub >= 0.27) or the older CLI, chosen once: a `||` chain
     # would mask a failed download as "command not found".
