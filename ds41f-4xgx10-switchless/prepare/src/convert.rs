@@ -267,9 +267,10 @@ fn open_rank(ck: &Checkpoint, o: &Options, rank: u32) -> Result<RankState, Strin
             (HashSet::new(), j)
         } else {
             Journal::begin_matches(&records, &fp, rank, o.world)?;
-            if state.done {
-                return Err(format!("{} is already complete (delete it or pass --replace)", out.display()));
-            }
+            // A done journal is no longer an error: `run` skips the ranks it
+            // finds complete, and the only one that gets here is a rank whose
+            // Engram shards a `--no-engram` run left out — the committed set
+            // then skips every tensor and only those shards are written.
             for r in &records {
                 if let Record::Commit { batch, outputs } = r {
                     if let Some(oc) = outputs.first() {
@@ -318,13 +319,48 @@ fn open_rank(ck: &Checkpoint, o: &Options, rank: u32) -> Result<RankState, Strin
     Ok(RankState { rank, plan, file, work, journal, committed, crcs })
 }
 
-/// Runs the conversion for the ranks in `o.ranks`, shard by shard.
+/// Whether a rank is finished: its journal says done and was written for this
+/// checkpoint, world and model. Such a rank is skipped: only the Engram shards a
+/// `--no-engram` run left out can still be missing.
+pub fn rank_done(ck: &Checkpoint, o: &Options, rank: u32) -> Result<bool, String> {
+    let j = journal_path(o, rank);
+    if !j.exists() {
+        return Ok(false);
+    }
+    let (records, state) = Journal::load(&j).map_err(|e| format!("{}: {e}", j.display()))?;
+    if !state.done {
+        return Ok(false);
+    }
+    let plan = plan::make_plan(&ck.tensors, rank, o.world)?;
+    Journal::begin_matches(&records, &fingerprint(&plan, &o.model), rank, o.world)?;
+    Ok(true)
+}
+
+/// A finished rank is only finished for what it was asked to write: a run that
+/// did `--no-engram` leaves no Engram shards behind, so a later one must cut them.
+fn engram_present(o: &Options, rank: u32, tables: &[Table]) -> bool {
+    tables.iter().all(|t| {
+        let p = engram_path(o, rank, t.layer);
+        std::fs::metadata(&p).map(|m| m.len() > 0).unwrap_or(false)
+    })
+}
+
+/// Runs the conversion for the ranks in `o.ranks`, shard by shard. A rank whose
+/// journal is done is left alone: re-running is how the tool is meant to be used.
 pub fn run(ck: &Checkpoint, reader: &dyn Reader, o: &Options, source_note: &str) -> Result<(), String> {
+    let tables: Vec<Table> = if o.engram { engram::tables(ck)? } else { Vec::new() };
     let mut states: Vec<RankState> = Vec::new();
     for &r in &o.ranks {
+        if rank_done(ck, o, r)? && (!o.engram || engram_present(o, r, &tables)) {
+            println!("rank {r}: complete, kept");
+            continue;
+        }
         states.push(open_rank(ck, o, r)?);
     }
-    let tables: Vec<Table> = if o.engram { engram::tables(ck)? } else { Vec::new() };
+    if states.is_empty() {
+        println!("[dsw-prepare] nothing to convert: every rank is already complete");
+        return Ok(());
+    }
     if o.consume && (o.ranks.len() != o.world as usize || !o.engram) {
         return Err(
             "--consume releases source blocks that other ranks still need: convert every rank and the Engram shards, or drop --consume"

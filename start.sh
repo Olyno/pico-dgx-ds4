@@ -1,33 +1,40 @@
 #!/usr/bin/env bash
-# Serve DeepSeek-V4.1-Flash (the ds41f engine) in a Docker container, end to
-# end: build the image from Dockerfile if needed, start the service
-# (engine/server/service.sh) inside a host-networked GPU container, wait
-# until the OpenAI API answers, then run a smoke test. Stop with ./stop.sh.
-# Settings come from ./.env (or $ENV_FILE), then the environment.
+# Serve DeepSeek-V4.1-Flash (the ds41f engine) in a Docker container, end to end.
+# With nothing on the command line it does the whole install: build the image, use
+# the checkpoint that is already here (or stream it from the Hub), cut every rank's
+# .dsw, its Engram shards and the hash map, ship the other ranks' files to the boxes
+# the fleet names, start the service, wait for the OpenAI API and run a smoke test.
+# Run it again after an interruption: finished ranks are kept, unfinished ones
+# resume, nothing is asked. Stop with ./stop.sh. Settings come from ./.env (or
+# $ENV_FILE), then the environment.
 #
-#   ./start.sh                 start (no-op if already serving)
-#   ./start.sh restart         stop, then start
+#   ./start.sh                 all of the above (nothing to do when it serves)
+#   ./start.sh serve           the container only; the files must be in place
+#   ./start.sh restart         stop, then all of the above
 #   ./start.sh status          exit 0 serving, 1 not
-#   ./start.sh fleet           write the fleet file from TP + WORKERS (fleet/gen-fleet.sh)
-#   ./start.sh prepare [ARGS]  one-time on rank 0: the checkpoint (downloaded or repaired
-#                              only when it is not already complete), then every rank's .dsw
-#                              and its Engram shards. ARGS go to dsw-prepare: --consume
-#                              releases the checkpoint's blocks as the outputs land,
-#                              --source http streams it instead of storing it,
-#                              --source hybrid caches one whole shard at a time, --replace
-#                              skips the "delete these?" prompt, --dest R=DIR writes a rank
-#                              straight to a mounted path
+#   ./start.sh prepare [ARGS]  only the files, by dsw-prepare; ARGS pass through to
+#                              it (--consume, --source local|http|hybrid, --clear,
+#                              --replace, --dest R=DIR, ...)
 #   ./start.sh clear           delete the rank files, journals, Engram shards and
 #                              scratch of earlier runs, keeping the checkpoint
 #                              (prepare --clear does the same, then converts)
 #   ./start.sh reshard --world N   re-cut an existing rank set for another TP from
 #                              the rank files alone (no checkpoint, no network, no
-#                              GPU): --from DIR (default ~/dsgb10/convert), --to DIR
-#                              (default ~/dsgb10/convert-tpN). The engine still
-#                              serves TP=4 only, so this is for trying other splits.
+#                              GPU): --from DIR (default the artifact directory),
+#                              --to DIR (default ~/dsgb10/convert-tpN). The engine
+#                              still serves TP=4 only, so this is for trying other
+#                              splits.
+#   ./start.sh fleet           write the fleet file from TP + WORKERS (fleet/gen-fleet.sh)
 #   ./start.sh --help
-#   DRY_RUN=1 ./start.sh       print the docker command, change nothing
+#   DRY_RUN=1 ./start.sh       print every command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
+# The default run streams the checkpoint as it converts (--consume): 507 GB of
+# model and 508 GB of rank files do not fit one disk. To keep the checkpoint,
+# run ./start.sh prepare without --consume first; it then refuses if it cannot.
+#
+# The artifacts live where the fleet puts rank 0's weight file (RANK0_WEIGHTS):
+# rank 0 reads them there, so nothing is copied on the head; its Engram shards and
+# the hash map sit beside it, under engram/.
 #
 # The rank count is not a setting: rank 0 is the head and every ssh target in
 # WORKERS is one more rank, so WORKERS="u@a u@b u@c" is a four-rank ring, and a
@@ -63,6 +70,26 @@ VISION_DIR="${VISION_DIR:-$HOME/dsgb10/vision}"
 VISION_PORT=18950
 WAIT_TIMEOUT="${WAIT_TIMEOUT:-900}"
 DRY="${DRY_RUN:-0}"
+
+# ------------------------------------------------------------ artifacts (files)
+# dsw-prepare cuts every rank's weight file, Engram shards and the hash map into
+# one directory, and rank 0 serves it from there: that is where the fleet already
+# puts RANK0_WEIGHTS. The other ranks get their three files rsynced before the
+# service starts, so one command on the head is the whole install.
+fleet_raw() { awk -F= -v k="RANK$1_$2" '$1 == k { sub(/^[^=]*=/, ""); print; exit }' "$FLEET" 2>/dev/null || true; }
+fleet_local() {
+  local v
+  v=$(fleet_raw "$1" "$2")
+  case "$v" in
+    "~") printf '%s' "$HOME" ;;
+    "~/"*) printf '%s/%s' "$HOME" "${v#\~/}" ;;
+    *) printf '%s' "$v" ;;
+  esac
+}
+OUT="$HOME/dsgb10/convert"
+if [ -n "$(fleet_raw 0 WEIGHTS)" ]; then
+  OUT=$(dirname "$(fleet_local 0 WEIGHTS)")
+fi
 
 die() { echo "[start.sh] ERROR: $*" >&2; exit 1; }
 warn() { echo "[start.sh] WARN: $*" >&2; }
@@ -122,21 +149,29 @@ ensure_image() {
 # ./start.sh clear: the outputs of earlier runs, never the checkpoint. Offline, so
 # it cannot start a download by accident.
 clear_outputs() {
-  local ttyarg=()
+  local ttyarg=() outarg=(--out "$OUT")
   [ -t 0 ] && ttyarg=(-it)
-  log "clear: deleting the rank files, journals, Engram shards and scratch of earlier runs"
+  for a in "$@"; do [ "$a" = "--out" ] && outarg=(); done
+  log "clear: deleting the rank files, journals, Engram shards and scratch of earlier runs in $OUT"
   if [ "$DRY" = "1" ]; then
     echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root \\"
-    echo "      $IMAGE prepare/target/release/dsw-prepare clear $*"
+    echo "      $IMAGE prepare/target/release/dsw-prepare clear ${outarg[*]} $*"
     return 0
   fi
   docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" \
-    "$IMAGE" prepare/target/release/dsw-prepare clear "$@" || die "clear failed"
+    "$IMAGE" prepare/target/release/dsw-prepare clear "${outarg[@]}" "$@" || die "clear failed"
 }
 
+# dsw-prepare inside the image. `auto` is the one-command run and adds what a
+# fresh install needs — every rank plus the Engram shards (that is the price of
+# --consume), the vision bundle when VISION=1, and --replace so that nothing
+# waits for a terminal; the tool itself says which checkpoint it found, which
+# source it chose and how much disk the peak takes. `explicit` passes the command
+# line through untouched.
 prepare() {
-  local out="$HOME/dsgb10/convert"
-  local envarg=()
+  local auto=$1
+  shift
+  local envarg=() a
   # docker run inherits none of this shell's environment: a proxy or a mirror
   # endpoint set here would be lost and the download would hang at 0 %.
   for v in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy \
@@ -149,37 +184,140 @@ prepare() {
   local ttyarg=()
   [ -t 0 ] && ttyarg=(-it)
 
-  local visionarg=()
-  [ "$VISION" = "1" ] && visionarg=(--vision)
-  # --world in ARGS is the explicit way to cut another world: do not repeat it.
-  local worldarg=(--world "$TP") a
-  for a in "$@"; do [ "$a" = "--world" ] && worldarg=(); done
-  log "prepare: checkpoint (only if not already complete), then $TP rank file(s) and Engram shards into $out"
-  [ "$DRY" = "1" ] && {
-    echo "    docker run --rm ${ttyarg[*]} --ipc=host --network host -v $HOME:/root -v /data:/data \\"
-    echo "      $IMAGE prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${visionarg[*]} $*"
+  local args=("$@") worldarg=(--world "$TP") outarg=(--out "$OUT")
+  for a in "$@"; do
+    [ "$a" = "--world" ] && worldarg=()
+    [ "$a" = "--out" ] && outarg=()
+  done
+  if [ "$auto" = "auto" ]; then
+    [ "$VISION" = "1" ] && args+=(--vision)
+    args+=(--replace --consume)
+  fi
+  log "prepare: $TP rank file(s), Engram shards and the hash map into $OUT"
+  # --cpu-shares, not --cpus: the conversion takes every core while the box is
+  # idle and steps aside when something else wants them (a third of the CPU).
+  local cmd=(docker run --rm "${ttyarg[@]}" --ipc=host --network host --cpu-shares 512
+    -v "$HOME:/root" -v /data:/data -w /work/ds41f-4xgx10-switchless "${envarg[@]}")
+  if [ "$DRY" = "1" ]; then
+    echo "    ${cmd[*]} $IMAGE prepare/target/release/dsw-prepare prepare ${worldarg[*]} ${outarg[*]} ${args[*]}"
     return 0
-  }
-  mkdir -p "$out"
-  docker run --rm "${ttyarg[@]}" --ipc=host --network host -v "$HOME:/root" -v /data:/data \
-    -w /work/ds41f-4xgx10-switchless "${envarg[@]}" \
-    "$IMAGE" prepare/target/release/dsw-prepare prepare "${worldarg[@]}" "${visionarg[@]}" "$@" ||
+  fi
+  mkdir -p "$OUT"
+  "${cmd[@]}" "$IMAGE" prepare/target/release/dsw-prepare prepare "${worldarg[@]}" "${outarg[@]}" "${args[@]}" ||
     die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
 }
 
-# ./start.sh reshard: re-cut a finished rank set for another world. Offline by
-# construction (`--network none`): every byte comes from the old files.
-reshard() {
-  local ttyarg=()
-  [ -t 0 ] && ttyarg=(-it)
-  log "reshard: re-cutting an existing rank set inside the container (no checkpoint, no network)"
-  if [ "$DRY" = "1" ]; then
-    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root \\"
-    echo "      $IMAGE prepare/target/release/dsw-prepare reshard $*"
+# How many of a rank's Engram shards a directory holds. A glob, not ls: compgen
+# says "no match" with status 1, which `|| true` absorbs under pipefail.
+shards_in() { compgen -G "$1/engram-l*-r$2of$TP.bin" 2>/dev/null | wc -l || true; }
+
+# What one rank has right now: "<Engram shards> <weight file and hash map: 0|1>".
+# Rank 0 is read here, the others over one ssh each (and not at all with
+# DRY_RUN=1). A non-zero status means the box could not be reached — that stops
+# the run rather than sending it off to download a checkpoint it does not need.
+rank_probe() {
+  local r=$1 w h e host files=0
+  w=$(fleet_raw "$r" WEIGHTS)
+  h=$(fleet_raw "$r" HASHMAP)
+  e=$(fleet_raw "$r" ENGRAM)
+  [ -n "$w" ] && [ -n "$h" ] && [ -n "$e" ] || return 1
+  if [ "$r" = "0" ]; then
+    [ -s "$(fleet_local 0 WEIGHTS)" ] && [ -s "$(fleet_local 0 HASHMAP)" ] && files=1
+    printf '%s %s' "$(shards_in "$(fleet_local 0 ENGRAM)" 0)" "$files"
     return 0
   fi
-  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" -w /work/ds41f-4xgx10-switchless \
-    "$IMAGE" prepare/target/release/dsw-prepare reshard "$@" || die "reshard failed"
+  host=$(fleet_raw "$r" SSH)
+  [ -n "$host" ] || return 1
+  [ "$DRY" = "1" ] && { printf '0 0'; return 0; }
+  # The paths are the fleet's own (`~` is left for the remote shell to expand).
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" \
+    "f=0; [ -s $w ] && [ -s $h ] && f=1; echo \$(ls $e/engram-l*-r${r}of$TP.bin 2>/dev/null | wc -l) \$f"
+}
+
+# One rank's three things: its weight file, the shared hash map and its own Engram
+# shards. rsync --size-only makes a second run a few stats, and --partial makes an
+# interrupted one resume.
+install_rank() {
+  local r=$1 w h e host
+  w=$(fleet_raw "$r" WEIGHTS)
+  h=$(fleet_raw "$r" HASHMAP)
+  e=$(fleet_raw "$r" ENGRAM)
+  host=$(fleet_raw "$r" SSH)
+  [ -n "$host" ] || die "RANK${r}_SSH is missing from $FLEET"
+  log "  rank $r -> $host"
+  if [ "$DRY" = "1" ]; then
+    echo "    ssh $host mkdir -p $(dirname "$w") $(dirname "$h") $e"
+    echo "    rsync -h --progress --partial --size-only $OUT/rank$r.dsw $host:$w"
+    echo "    rsync -h --progress --partial --size-only $OUT/engram/engram_hashmap.bin $host:$h"
+    echo "    rsync -h --progress --partial --size-only $OUT/engram/engram-l*-r${r}of$TP.bin $host:$e/"
+    return 0
+  fi
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$host" "mkdir -p $(dirname "$w") $(dirname "$h") $e" ||
+    die "cannot reach $host (rank $r)"
+  rsync -h --progress --partial --size-only "$OUT/rank$r.dsw" "$host:$w" ||
+    die "rank $r's weight file did not arrive at $host:$w"
+  rsync -h --progress --partial --size-only "$OUT/engram/engram_hashmap.bin" "$host:$h" ||
+    die "the hash map did not arrive at $host:$h"
+  rsync -h --progress --partial --size-only "$OUT"/engram/engram-l*-r${r}of$TP.bin "$host:$e/" ||
+    die "rank $r's Engram shards did not arrive at $host:$e/"
+}
+
+# The files, cut only when they are not already where the fleet says: a second
+# ./start.sh is a handful of stats and a wait.
+ensure_artifacts() {
+  local r probe counts=() files=() maxc=0 missing=()
+  for ((r = 0; r < TP; r++)); do
+    probe=$(rank_probe "$r") || die "cannot reach rank $r ($(fleet_raw "$r" SSH)): its files cannot be checked or shipped"
+    counts+=("${probe% *}")
+    files+=("${probe#* }")
+    [ "${counts[r]}" -gt "$maxc" ] && maxc=${counts[r]}
+  done
+  # The rank with the most Engram shards sets the number every rank must have:
+  # a directory that lost one (an interrupted ship) is not ready, and the same
+  # count on all of them means the set is whole.
+  [ "$maxc" -gt 0 ] || maxc=1
+  for ((r = 0; r < TP; r++)); do
+    if [ "${files[r]}" != "1" ] || [ "${counts[r]}" -lt "$maxc" ]; then
+      missing+=("$r")
+    fi
+  done
+  if [ ${#missing[@]} -eq 0 ]; then
+    log "artifacts: all $TP rank(s) in place in $OUT ($maxc Engram shard(s) each)"
+    return 0
+  fi
+  log "artifacts: rank(s) ${missing[*]} not in place — preparing (hours; Ctrl-C is safe, the next run resumes)"
+  prepare auto
+  if [ "$DRY" = "1" ]; then
+    for ((r = 1; r < TP; r++)); do install_rank "$r"; done
+    log "DRY_RUN: would check all $TP rank(s) once the install is done"
+    return 0
+  fi
+  for ((r = 1; r < TP; r++)); do install_rank "$r"; done
+  for ((r = 0; r < TP; r++)); do
+    probe=$(rank_probe "$r") || die "rank $r stopped answering ($(fleet_raw "$r" SSH))"
+    if [ "${probe% *}" -lt "$maxc" ] || [ "${probe#* }" != "1" ]; then
+      die "rank $r still lacks its files ($(fleet_raw "$r" WEIGHTS), $(fleet_raw "$r" ENGRAM))"
+    fi
+  done
+  log "artifacts: all $TP rank(s) in place in $OUT ($maxc Engram shard(s) each)"
+}
+
+# ./start.sh reshard: re-cut a finished rank set for another world. Offline by
+# construction (`--network none`): every byte comes from the old files, and the
+# default source is the artifact directory the fleet names.
+reshard() {
+  local ttyarg=() args=("$@") fromarg=(--from "$OUT") a
+  [ -t 0 ] && ttyarg=(-it)
+  for a in "$@"; do [ "$a" = "--from" ] && fromarg=(); done
+  log "reshard: re-cutting the rank set in $OUT inside the container (no checkpoint, no network)"
+  if [ "$DRY" = "1" ]; then
+    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root -v /data:/data \\"
+    echo "      $IMAGE prepare/target/release/dsw-prepare reshard ${fromarg[*]} ${args[*]}"
+    return 0
+  fi
+  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" -v /data:/data \
+    -w /work/ds41f-4xgx10-switchless \
+    "$IMAGE" prepare/target/release/dsw-prepare reshard "${fromarg[@]}" "${args[@]}" || die "reshard failed"
 }
 
 # The image encoder is a side process on rank 0 (docs/vision.md): it imports the
@@ -207,9 +345,12 @@ start_vision() {
   log "vision encoder on 127.0.0.1:$VISION_PORT (model $VISION_DIR)"
 }
 
-MODE=start
+MODE=run
+FORCE_STOP=0
 case "${1:-}" in
-  start | restart | status | fleet | prepare | clear | reshard) MODE=$1; shift ;;
+  run | start) shift ;;
+  restart) FORCE_STOP=1; shift ;;
+  serve | status | fleet | prepare | clear | reshard) MODE=$1; shift ;;
   -h | --help | help) usage; exit 0 ;;
 esac
 for arg in "$@"; do
@@ -233,6 +374,18 @@ if [ "$MODE" != "clear" ] && [ "$MODE" != "reshard" ]; then
   if [ "$TP" != "4" ]; then
     warn "TP=$TP: the engine is TP=4 specialised (engine/common/tp.h). prepare cuts --world $TP files, but dsgb10_rank refuses TP=$TP until the kernels and ring are generalised."
   fi
+  # dsw-prepare cuts the weight files, the Engram shards and the hash map into one
+  # directory, and rank 0 serves it from there. A fleet that puts rank 0 somewhere
+  # else would serve nothing, so say what to change instead of copying 180 GB.
+  if [ "$(fleet_local 0 WEIGHTS)" != "$OUT/rank0.dsw" ] ||
+    [ "$(fleet_local 0 HASHMAP)" != "$OUT/engram/engram_hashmap.bin" ] ||
+    [ "$(fleet_local 0 ENGRAM)" != "$OUT/engram" ]; then
+    die "$FLEET puts rank 0's files outside the directory they are cut into. Set, in $FLEET:
+    RANK0_WEIGHTS=$OUT/rank0.dsw
+    RANK0_HASHMAP=$OUT/engram/engram_hashmap.bin
+    RANK0_ENGRAM=$OUT/engram
+  (it has RANK0_WEIGHTS=$(fleet_local 0 WEIGHTS), RANK0_HASHMAP=$(fleet_local 0 HASHMAP), RANK0_ENGRAM=$(fleet_local 0 ENGRAM))"
+  fi
 fi
 
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>/dev/null)" = "true" ]; }
@@ -244,10 +397,20 @@ if [ "$MODE" = "status" ]; then
   exit 1
 fi
 
+# Serving already: no rebuild, no re-cut, no restart.
+if [ "$MODE" = "run" ] && [ "$FORCE_STOP" = "0" ] && [ "$DRY" != "1" ] && running; then
+  if curl -s --max-time 5 "http://127.0.0.1:$PORT/health" | grep -qx ok; then
+    log "already serving on http://127.0.0.1:$PORT: nothing to do (./start.sh restart, ./stop.sh, ./start.sh status)"
+    exit 0
+  fi
+  log "the container runs but the API is not answering: restarting it"
+  ./stop.sh
+fi
+
 # ---------------------------------------------------------------- 1. image
 ensure_image
 if [ "$MODE" = "prepare" ]; then
-  prepare "$@"
+  prepare explicit "$@"
   exit 0
 fi
 if [ "$MODE" = "clear" ]; then
@@ -259,7 +422,17 @@ if [ "$MODE" = "reshard" ]; then
   exit 0
 fi
 
-# ---------------------------------------------------------------- 2. files
+# ---------------------------------------------------------------- 2. artifacts
+# The whole install, skipped when the fleet's paths already hold it: cut the rank
+# files, Engram shards and hash map (the tool decides the checkpoint and the
+# source), then ship the other ranks' three files.
+if [ "$MODE" = "run" ]; then
+  ensure_artifacts
+else
+  log "serve: using the files in $OUT as they are"
+fi
+
+# ---------------------------------------------------------------- 3. files
 if [ "$NO_AUTH" = "1" ]; then
   log "DSGB10_NO_AUTH=1: serving without a bearer key (only safe on loopback or a trusted network)"
 elif [ ! -r "$KEY" ]; then
@@ -293,7 +466,7 @@ fi
 # copies it beside the rank files, so it survives the checkpoint's deletion.
 TOKENIZER="${TOKENIZER:-}"
 if [ -z "$TOKENIZER" ]; then
-  for c in "$HOME/dsgb10/convert/tokenizer.json" "$HOME/DeepSeek-V4.1-Flash-1017/tokenizer.json" \
+  for c in "$OUT/tokenizer.json" "$HOME/DeepSeek-V4.1-Flash-1017/tokenizer.json" \
     "$HOME/DeepSeek-V4.1-Flash/tokenizer.json" /data/models/DeepSeek-V4.1-Flash/tokenizer.json; do
     if [ -f "$c" ]; then TOKENIZER=$c && break; fi
   done
@@ -303,11 +476,7 @@ if [ -z "$TOKENIZER" ]; then
     die "no tokenizer.json found: run ./start.sh prepare, or set TOKENIZER=FILE"
 fi
 
-# ---------------------------------------------------------------- 3. previous
-if [ "$DRY" != "1" ] && [ "$MODE" = "start" ] && running; then
-  log "$CONTAINER is already running: nothing to do (./start.sh restart to restart, ./stop.sh to stop)"
-  exit 0
-fi
+# ---------------------------------------------------------------- 4. previous
 if [ "$DRY" != "1" ] && { running || docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx "$CONTAINER"; }; then
   log "stopping the previous container $CONTAINER..."
   ./stop.sh
@@ -317,7 +486,7 @@ if ss -ltn "sport = :$PORT" 2>/dev/null | grep -q LISTEN; then
     die "port $PORT is already in use: $(ss -ltnp "sport = :$PORT" 2>/dev/null | tail -n +2)"
 fi
 
-# ---------------------------------------------------------------- 4. launch
+# ---------------------------------------------------------------- 5. launch
 # Host networking keeps the fleet file's ConnectX-7 addresses; --gpus and
 # /dev/infiniband give the GPU and the RDMA devices; $HOME:/root makes the
 # fleet's ~/ paths (weights, Engram, spill, key, gate) resolve in-container.
@@ -381,7 +550,7 @@ start_vision
 log "starting $CONTAINER (TP=$TP, port $PORT)"
 "${cmd[@]}"
 
-# ---------------------------------------------------------------- 5. wait + smoke
+# ---------------------------------------------------------------- 6. wait + smoke
 log "waiting for the API (up to ${WAIT_TIMEOUT}s)..."
 tries=0
 until curl -s --max-time 5 "http://127.0.0.1:$PORT/health" | grep -qx ok; do

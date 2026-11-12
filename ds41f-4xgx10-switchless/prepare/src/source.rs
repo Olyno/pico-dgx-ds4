@@ -295,9 +295,11 @@ pub fn hub_url(endpoint: &str, repo: &str, rev: &str, shard: &str) -> String {
 pub fn curl_args(url: &str, off: u64, len: u64, token: Option<&str>) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-sSfL".into(),
-        // A proxy that ignores Range would stream the whole shard; abort instead.
-        "--max-filesize".into(),
-        (len + 1).to_string(),
+        // No `--max-filesize` here: it compares the *declared* body with the cap,
+        // so a server that ignores Range (a Xet-backed Hub URL does) makes curl
+        // abort with "(63) Maximum file size exceeded" before the reader can say
+        // what happened. The reader asks for `len` bytes and treats the one extra
+        // byte that means "the whole file" as the error it is.
         "-H".into(),
         format!("Range: bytes={}-{}", off, off + len - 1),
         "-H".into(),
@@ -352,9 +354,22 @@ impl HttpRange {
         let over = matches!(stdout.read(&mut extra), Ok(n) if n > 0);
         drop(stdout);
         let out = child.wait_with_output()?;
+        // Before the exit status: closing the pipe makes curl die of EPIPE, and
+        // that would hide the only thing worth saying.
+        if over {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "the server sent the whole shard for bytes {off}+{} (it does not honour Range: \
+                     Xet-backed Hub URLs answer 200): download the checkpoint first (hf download) \
+                     and run with --source local",
+                    buf.len()
+                ),
+            ));
+        }
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
-            return Err(io::Error::other(format!("curl: {}", err.trim())));
+            return Err(io::Error::other(err.trim().to_string()));
         }
         if got != buf.len() {
             return Err(io::Error::new(
@@ -387,6 +402,8 @@ impl Source for HttpRange {
         loop {
             match self.once(off, buf) {
                 Ok(()) => return Ok(()),
+                // A server that ignores Range will ignore it on every retry.
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => return Err(e),
                 Err(e) if attempt < self.retries => {
                     attempt += 1;
                     std::thread::sleep(std::time::Duration::from_millis(200 << (attempt - 1).min(4)));
@@ -429,11 +446,12 @@ mod tests {
     }
 
     #[test]
-    fn curl_is_told_the_exact_range_and_a_size_cap() {
+    fn curl_is_told_the_exact_range_and_no_size_cap() {
         let a = curl_args("http://h/f", 100, 50, None);
         assert!(a.iter().any(|x| x == "Range: bytes=100-149"), "{a:?}");
-        let cap = a.iter().position(|x| x == "--max-filesize").unwrap();
-        assert_eq!(a[cap + 1], "51");
+        // A declared-size cap turns "this server ignores Range" into curl's
+        // opaque (63); the reader detects that itself.
+        assert!(!a.iter().any(|x| x == "--max-filesize"), "{a:?}");
         assert!(a.iter().any(|x| x == "Accept-Encoding: identity"));
         let a = curl_args("http://h/f", 0, 8, Some("hf_x"));
         assert!(a.iter().any(|x| x == "Authorization: Bearer hf_x"));
@@ -487,12 +505,13 @@ mod tests {
         let url = format!("http://{}/shard", l.local_addr().unwrap());
         let b3 = body.clone();
         let t = std::thread::spawn(move || serve_once(l, b3, true));
-        let s = HttpRange::new(url, body.len() as u64, None, 0);
+        // Two retries are allowed: a 200 answer must fail once, not three times
+        // (the server is gone after one request, so a retry could only report
+        // "connection refused" instead).
+        let s = HttpRange::new(url, body.len() as u64, None, 2);
         let err = s.read_at(0, &mut got).unwrap_err();
         t.join().unwrap();
-        assert!(
-            err.to_string().contains("Range ignored") || err.to_string().contains("curl"),
-            "a 200 answer must fail, not silently fill the buffer: {err}"
-        );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
+        assert!(err.to_string().contains("does not honour Range"), "a 200 answer must name the cause: {err}");
     }
 }

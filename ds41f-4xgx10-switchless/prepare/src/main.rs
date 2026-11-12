@@ -120,7 +120,10 @@ fn main() {
         usage();
     }
     let cmd = args[0].clone();
-    let mut ckpt = home().join("DeepSeek-V4.1-Flash-1017");
+    // Not a single fixed name: the checkpoint may already be here under another
+    // one (/data, the Hub cache), and downloading 507 GB again is not a default.
+    let mut ckpt = dsw_prepare::checkpoint::discover(&home())
+        .unwrap_or_else(|| home().join("DeepSeek-V4.1-Flash-1017"));
     let mut out = home().join("dsgb10/convert");
     let mut world = 4u32;
     let mut ranks: Option<Vec<u32>> = None;
@@ -326,10 +329,17 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
     // The local checkpoint wins whenever it is already complete; a download goes
     // through the hybrid source, which keeps one shard on disk at a time.
     let source: &str = if source == "auto" {
-        if Checkpoint::open(ckpt).is_ok() {
-            "local"
-        } else {
-            "hybrid"
+        match Checkpoint::open(ckpt) {
+            Ok(_) => "local",
+            // A directory that holds shards is not "nothing to lose": quietly
+            // downloading 507 GB over a copy that will not open is how a run
+            // that should have failed in a second hangs for hours.
+            Err(why) if dsw_prepare::checkpoint::has_shards(ckpt) => die(&format!(
+                "{why}\n  the checkpoint at {} is there but unusable: delete it to download a fresh \
+                 copy, point --ckpt at an intact one, or pass --source hybrid to ignore it",
+                ckpt.display()
+            )),
+            Err(_) => "hybrid",
         }
     } else {
         source
@@ -358,6 +368,26 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
         }
     };
 
+
+    // --consume punches holes in the checkpoint as it goes, so a checkpoint that
+    // an earlier run released has zeroes where the tensors were: converting from
+    // it again would write those zeroes into the rank files without a word.
+    // Only a run that has something to cut reads it, though: the usual re-run on
+    // finished outputs walks in, says there is nothing to do and walks out.
+    let needs_work = clear
+        || !o.resume
+        || o.ranks.iter().any(|&r| !convert::rank_done(&ck, o, r).unwrap_or(true));
+    let released = if needs_work { ck.released() } else { Vec::new() };
+    if !released.is_empty() {
+        die(&format!(
+            "{} of {} shard(s) in {} were released by an earlier --consume and now read as zeros; \
+             converting from them would write zeros into the rank files. Download the checkpoint \
+             again (remove the directory first) or point --ckpt at an intact copy",
+            released.len(),
+            ck.shards.len(),
+            ckpt.display()
+        ));
+    }
 
     // What this run will write, per rank, from the plan itself.
     let mut need: u64 = 0;
@@ -395,13 +425,13 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
     };
     if !existing.is_empty() {
         let (keep, stale): (Vec<PathBuf>, Vec<PathBuf>) = if o.resume {
-            existing.into_iter().partition(|p| resumable(o, p))
+            existing.into_iter().partition(|p| keep_existing(&ck, o, p))
         } else {
             (Vec::new(), existing)
         };
         if !keep.is_empty() {
             println!(
-                "[dsw-prepare] resuming: keeping {} file(s) from an interrupted run (--no-resume starts over)",
+                "[dsw-prepare] keeping {} file(s): finished ranks are left as they are, unfinished ones resume (--no-resume starts over)",
                 keep.len()
             );
         }
@@ -650,29 +680,38 @@ fn bytes_of(p: &Path) -> u64 {
     std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| bytes_of(&e.path())).sum()
 }
 
-/// Whether an existing file belongs to an unfinished run that the journal can
-/// continue: `rank<r>.(dsw|journal)[.part]` whose journal exists and is not done,
-/// or the Engram directory beside such a journal.
-fn resumable(o: &Options, p: &Path) -> bool {
+/// Whether an existing file belongs to a run this tool keeps: `rank<r>.*` whose
+/// journal parses and was written for this checkpoint, world and model, or the
+/// Engram directory beside such a journal. A finished rank is kept as it is (the
+/// conversion skips it), an unfinished one resumes; only what matches neither is
+/// offered for deletion.
+fn keep_existing(ck: &Checkpoint, o: &Options, p: &Path) -> bool {
     if p.is_dir() {
-        return o.ranks.iter().any(|&r| journal_running(o, r));
+        return o.ranks.iter().any(|&r| rank_kept(ck, o, r));
     }
     let name = p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let Some(rest) = name.strip_prefix("rank") else { return false };
     match rest.split('.').next().and_then(|s| s.parse::<u32>().ok()) {
-        Some(r) => journal_running(o, r),
+        Some(r) => rank_kept(ck, o, r),
         None => false,
     }
 }
 
-fn journal_running(o: &Options, rank: u32) -> bool {
+fn rank_kept(ck: &Checkpoint, o: &Options, rank: u32) -> bool {
     let j = convert::journal_path(o, rank);
     if !j.exists() {
         return false;
     }
-    match dsw_prepare::journal::Journal::load(&j) {
-        Ok((_records, state)) => !state.done,
-        // Unreadable is not resumable, and the next run would refuse it anyway.
+    // Unreadable is not kept: the next run could not continue it either.
+    let Ok((records, _state)) = dsw_prepare::journal::Journal::load(&j) else { return false };
+    match plan::make_plan(&ck.tensors, rank, o.world) {
+        Ok(p) => dsw_prepare::journal::Journal::begin_matches(
+            &records,
+            &convert::fingerprint(&p, &o.model),
+            rank,
+            o.world,
+        )
+        .is_ok(),
         Err(_) => false,
     }
 }
@@ -709,44 +748,46 @@ fn hashmap(ck: &Checkpoint, o: &Options) -> Result<(), String> {
     if let Some(p) = out.parent() {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
+    // The map is a function of the checkpoint alone, so a rerun has nothing to
+    // add to one that is already there.
+    if out.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+        println!("[dsw-prepare] hash map: {} (kept)", out.display());
+        return Ok(());
+    }
     let script = Path::new("engine/engram/py/make_hashmap_stdlib.py");
     if !script.exists() {
         return Err("engine/engram/py/make_hashmap_stdlib.py not found (run from the repo)".into());
     }
+    // Beside the target, then renamed: an interrupted script leaves no file the
+    // engine would read as a complete table.
+    let tmp = out.with_extension("bin.part");
     let st = std::process::Command::new("python3")
         .arg(script)
         .arg(dir)
-        .arg(&out)
+        .arg(&tmp)
         .status()
         .map_err(|e| e.to_string())?;
     if !st.success() {
+        let _ = std::fs::remove_file(&tmp);
         return Err("make_hashmap_stdlib.py failed".into());
     }
+    std::fs::rename(&tmp, &out).map_err(|e| format!("{}: {e}", out.display()))?;
     println!("[dsw-prepare] hash map: {}", out.display());
     Ok(())
 }
 
 fn print_distribution(o: &Options) {
-    println!("[dsw-prepare] done. Put each rank's three files where the fleet's RANK<r>_* says:");
+    println!("[dsw-prepare] done. Rank 0 reads its files where they were written; the others need three each:");
     for &r in &o.ranks {
         let d = convert::dir_for(o, r);
-        let e = d.join("engram");
         println!("  rank {r}: {}", d.display());
-        println!("    rank{r}.dsw                     -> RANK{r}_WEIGHTS");
-        println!("    engram/engram_hashmap.bin       -> RANK{r}_HASHMAP");
-        println!("    engram/engram-l*-r{r}of{}.bin   -> RANK{r}_ENGRAM/", o.world);
-        if o.dest.get(&r).is_none() && r != 0 {
-            println!("    rsync -h --progress {} <RANK{r}_SSH>:<RANK{r}_WEIGHTS>", convert::dsw_path(o, r).display());
-            println!(
-                "    rsync -h --progress {} <RANK{r}_SSH>:<RANK{r}_HASHMAP>",
-                e.join("engram_hashmap.bin").display()
-            );
-            println!(
-                "    rsync -h --progress {} <RANK{r}_SSH>:<RANK{r}_ENGRAM>/",
-                e.join(format!("engram-l*-r{r}of{}.bin", o.world)).display()
-            );
+        if r != 0 || o.dest.contains_key(&r) {
+            println!("    rank{r}.dsw                     -> RANK{r}_WEIGHTS");
+            println!("    engram/engram_hashmap.bin       -> RANK{r}_HASHMAP");
+            println!("    engram/engram-l*-r{r}of{}.bin   -> RANK{r}_ENGRAM/", o.world);
         }
     }
+    println!("[dsw-prepare] ./start.sh ships them and serves; flags: --consume --source --clear --vision");
 }
 
 fn status(out: &Path, world: u32) {
@@ -811,40 +852,59 @@ mod tests {
     }
 
     #[test]
-    fn an_unfinished_run_is_resumed_not_deleted() {
+    fn a_rank_is_kept_while_it_resumes_and_once_it_is_done() {
         use dsw_prepare::journal::{Journal, Record, VERSION};
-        let dir = std::env::temp_dir().join(format!("dsw-resume-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("dsw-keep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let o = Options { ranks: vec![0], out: dir.clone(), ..Options::default() };
+        let ckdir = dir.join("ck");
+        std::fs::create_dir_all(&ckdir).unwrap();
+        // One shard, one tensor: an 8-byte length, the header JSON, the data.
+        let header = br#"{"embed.weight":{"dtype":"BF16","shape":[8,4],"data_offsets":[0,64]}}"#;
+        let mut shard = (header.len() as u64).to_le_bytes().to_vec();
+        shard.extend_from_slice(header);
+        shard.extend_from_slice(&[0u8; 64]);
+        std::fs::write(ckdir.join("model-00001-of-00001.safetensors"), shard).unwrap();
+        let ck = Checkpoint::open(&ckdir).unwrap();
+        let o = Options { ranks: vec![0], out: dir.join("out"), ..Options::default() };
+        std::fs::create_dir_all(&o.out).unwrap();
         let j = convert::journal_path(&o, 0);
         let dsw = convert::dsw_path(&o, 0);
-        // Nothing was written yet: nothing to resume.
-        assert!(!resumable(&o, &j));
-        assert!(!resumable(&o, &dsw));
+
+        // Nothing was written yet: nothing to keep.
+        assert!(!keep_existing(&ck, &o, &j));
+        assert!(!keep_existing(&ck, &o, &dsw));
+
+        let plan = plan::make_plan(&ck.tensors, 0, o.world).unwrap();
+        let fp = convert::fingerprint(&plan, &o.model);
+        let begin = |fingerprint: &str| Record::Begin {
+            version: VERSION,
+            fingerprint: fingerprint.to_string(),
+            rank: 0,
+            world: o.world,
+            out: dsw.display().to_string(),
+        };
+        // A journal written for another checkpoint cannot be continued, so it is
+        // not kept either.
+        let mut jr = Journal::create(&j).unwrap();
+        jr.append(&begin("some other plan")).unwrap();
+        assert!(!keep_existing(&ck, &o, &j), "a foreign journal is stale, not kept");
+        std::fs::remove_file(&j).unwrap();
 
         let mut jr = Journal::create(&j).unwrap();
-        jr.append(&Record::Begin {
-            version: VERSION,
-            fingerprint: "plan".into(),
-            rank: 0,
-            world: 4,
-            out: dir.display().to_string(),
-        })
-        .unwrap();
-        // A begun journal, the half-written file and the Engram directory are the
-        // state the next run continues from.
-        assert!(resumable(&o, &j));
+        jr.append(&begin(&fp)).unwrap();
+        // Begun: the journal, the partial file and the Engram directory resume.
+        assert!(keep_existing(&ck, &o, &j));
         let mut part = dsw.clone().into_os_string();
         part.push(".part");
-        assert!(resumable(&o, Path::new(&part)));
-        std::fs::create_dir_all(dir.join("engram")).unwrap();
-        assert!(resumable(&o, &dir.join("engram")));
+        assert!(keep_existing(&ck, &o, Path::new(&part)));
+        std::fs::create_dir_all(o.out.join("engram")).unwrap();
+        assert!(keep_existing(&ck, &o, &o.out.join("engram")));
 
-        // A finished journal is ordinary output, not resume state.
+        // Finished: kept as it is (the conversion skips the rank), never a prompt.
         jr.append(&Record::Done { file: dsw.display().to_string(), bytes: 1, tensors: 1 }).unwrap();
-        assert!(!resumable(&o, &j));
-        assert!(!resumable(&o, &dir.join("engram")));
+        assert!(keep_existing(&ck, &o, &j));
+        assert!(keep_existing(&ck, &o, &dsw));
+        assert!(keep_existing(&ck, &o, &o.out.join("engram")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
