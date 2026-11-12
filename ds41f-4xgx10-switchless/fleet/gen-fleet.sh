@@ -20,7 +20,7 @@ set -u
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 FLEET_SH=$REPO/ds41f-4xgx10-switchless/engine/server/fleet.sh
 
-TP=${TP:-${DSGB10_TP:-4}}
+TP=${TP:-${DSGB10_TP:-}}
 GID_INDEX=${GID_INDEX:-3}
 NEXT_DEV0=${NEXT_DEV0:-rocep1s0f0}
 NEXT_DEV1=${NEXT_DEV1:-roceP2p1s0f0}
@@ -50,6 +50,14 @@ while [ $# -gt 0 ]; do
 done
 
 die() { echo "gen-fleet: $*" >&2; exit 1; }
+# The rank count follows the targets when it is not given: the head is local and
+# every ssh target in WORKERS is one more rank.
+if [ -z "$TP" ]; then
+  read -r -a _W <<< "${WORKERS:-${WORKER:-}}"
+  [ "${#_W[@]}" -gt 0 ] ||
+    die "set TP (2..16), or WORKERS=\"user@host ...\" and TP follows the target count"
+  TP=$((${#_W[@]} + 1))
+fi
 [[ $TP =~ ^[0-9]+$ ]] && [ "$TP" -ge 2 ] && [ "$TP" -le 16 ] || die "TP='$TP': a ring is 2..16 ranks"
 [[ $GID_INDEX =~ ^[0-9]+$ ]] || die "GID_INDEX='$GID_INDEX' is not a number"
 [[ $LINK_BASE =~ ^[0-9]+$ ]] && [ $((LINK_BASE + 2 * TP - 1)) -le 255 ] || die "LINK_BASE='$LINK_BASE': 2*TP subnets must fit 192.168.0-255"

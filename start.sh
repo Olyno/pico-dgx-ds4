@@ -45,6 +45,14 @@ if [ -f "$ENV_FILE" ]; then
   echo "[start.sh] loaded env from $ENV_FILE"
 fi
 
+# TP is the tensor-parallel degree, and the fleet is the head plus one box per
+# ssh target, so WORKERS may state it instead: TP = 1 + the targets. An explicit
+# TP (or DSGB10_TP) still wins, and with neither, the engine's own world, 4.
+if [ -z "${TP:-}" ] && [ -z "${DSGB10_TP:-}" ] && [ -n "${WORKERS:-${WORKER:-}}" ]; then
+  read -r -a _workers <<< "${WORKERS:-${WORKER:-}}"
+  TP=$((${#_workers[@]} + 1))
+  echo "[start.sh] TP=$TP from WORKERS (${#_workers[@]} ssh target(s) plus the head)"
+fi
 export TP="${TP:-${DSGB10_TP:-4}}"
 export DSGB10_TP="$TP"
 IMAGE="${IMAGE:-pico-dgx-ds4:latest}"

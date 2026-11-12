@@ -160,7 +160,9 @@ cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, port
 ```
 
 `./start.sh fleet` derives the rank count, per-rank paths and the ring's link addresses from `TP` and
-`WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs. The API key
+`WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs.
+`WORKERS` alone is enough: with `TP` unset it is `1 + the targets` (rank 0 is the head, so three targets are `TP=4`),
+which is what `prepare` cuts for and what the ring is built for. The API key
 is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
 
 `./start.sh prepare` is the one-time setup on rank 0, run by `dsw-prepare`
