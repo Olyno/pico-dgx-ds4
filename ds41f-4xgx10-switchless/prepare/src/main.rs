@@ -727,15 +727,23 @@ fn hashmap(ck: &Checkpoint, o: &Options) -> Result<(), String> {
 }
 
 fn print_distribution(o: &Options) {
-    println!("[dsw-prepare] done. Install each rank's files where the fleet file says:");
+    println!("[dsw-prepare] done. Put each rank's three files where the fleet's RANK<r>_* says:");
     for &r in &o.ranks {
         let d = convert::dir_for(o, r);
-        println!("  rank {r}: {} (rank{r}.dsw, engram/)", d.display());
+        let e = d.join("engram");
+        println!("  rank {r}: {}", d.display());
+        println!("    rank{r}.dsw                     -> RANK{r}_WEIGHTS");
+        println!("    engram/engram_hashmap.bin       -> RANK{r}_HASHMAP");
+        println!("    engram/engram-l*-r{r}of{}.bin   -> RANK{r}_ENGRAM/", o.world);
         if o.dest.get(&r).is_none() && r != 0 {
             println!("    rsync -h --progress {} <RANK{r}_SSH>:<RANK{r}_WEIGHTS>", convert::dsw_path(o, r).display());
             println!(
+                "    rsync -h --progress {} <RANK{r}_SSH>:<RANK{r}_HASHMAP>",
+                e.join("engram_hashmap.bin").display()
+            );
+            println!(
                 "    rsync -h --progress {} <RANK{r}_SSH>:<RANK{r}_ENGRAM>/",
-                d.join("engram").display()
+                e.join(format!("engram-l*-r{r}of{}.bin", o.world)).display()
             );
         }
     }
