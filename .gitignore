@@ -9,3 +9,4 @@ __pycache__/
 # never commit secrets
 *.key
 .env
+fleet.conf

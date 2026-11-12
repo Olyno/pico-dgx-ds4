@@ -161,10 +161,10 @@ cp .env.example .env && $EDITOR .env     # optional: PORT, ADDR, MODEL, ...
 ./stop.sh                                # graceful stop, then remove the container
 ```
 
-The rank list is [`fleet/homelab.conf`](ds41f-4xgx10-switchless/fleet/homelab.conf) — rank 0 plus the boxes it names —
-and it is what the rank count comes from: there is no TP to set. If that file is missing, `fleet/gen-fleet.sh` writes it
-from `WORKERS` (per-rank paths and the ring's link addresses included; only the RDMA device names and `GID_INDEX` stay
-inputs). The API key is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network
+The rank list is `fleet.conf` at the repo root — rank 0 plus the boxes it names — and it is what the rank count comes
+from: there is no TP to set. `./start.sh` writes it from `WORKERS` on the first run (per-rank paths and the ring's link
+addresses included; only the RDMA device names and `GID_INDEX` stay inputs).
+[`fleet/homelab.conf`](ds41f-4xgx10-switchless/fleet/homelab.conf) is the upstream author's fleet, kept as a reference. The API key is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network
 only — with `DSGB10_ADDR=0.0.0.0` that is an open endpoint).
 
 The cutting is done by `dsw-prepare` (`ds41f-4xgx10-switchless/prepare`, Rust, CPU only — it does not need the GPU),

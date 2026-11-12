@@ -49,7 +49,9 @@ fi
 # are still accepted, in case an .env predates this).
 IMAGE="${IMAGE:-pico-dgx-ds4:latest}"
 CONTAINER="${CONTAINER_NAME:-pico-dgx-ds4}"
-FLEET="${FLEET:-$REPO/ds41f-4xgx10-switchless/fleet/homelab.conf}"
+# Our own fleet file, generated from WORKERS on the first run. fleet/homelab.conf is the
+# upstream author's four boxes (10.0.0.x), kept as a reference — never the default.
+FLEET="${FLEET:-$REPO/fleet.conf}"
 PORT="${PORT:-${DSGB10_PORT:-8888}}"
 ADDR="${ADDR:-${DSGB10_ADDR:-127.0.0.1}}"
 MODEL="${MODEL:-${DSGB10_MODEL:-deepseek-v4.1-flash}}"
@@ -381,7 +383,7 @@ fi
 if [ "$MODE" != "clear" ]; then
   # WORKERS alone is enough: the fleet file is written from it the first time.
   if [ ! -f "$FLEET" ]; then
-    [ -n "${WORKERS:-${WORKER:-}}" ] || die "no fleet file $FLEET and no WORKERS: set WORKERS=\"u@a u@b u@c\" in .env"
+    [ -n "${WORKERS:-${WORKER:-}}" ] || die "no fleet file $FLEET: set WORKERS=\"user@box2 user@box3 user@box4\" in .env (rank 0 is this box) and it is written for you"
     "$REPO/ds41f-4xgx10-switchless/fleet/gen-fleet.sh" --out "$FLEET" >/dev/null ||
       die "could not write $FLEET from WORKERS"
     log "fleet: wrote $FLEET from WORKERS"

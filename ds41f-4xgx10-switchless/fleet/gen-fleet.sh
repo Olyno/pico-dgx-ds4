@@ -38,8 +38,8 @@ RING_LOCK=${RING_LOCK:-/data/dsgb10/ring.lock}
 # The directory dsw-prepare cuts into: rank 0 serves it in place, ./start.sh
 # ships the other ranks' three files from it.
 [ -n "${WEIGHTS:-}" ] || WEIGHTS='~/dsgb10/convert/rank{rank}.dsw'
-HASHMAP=${HASHMAP:-~/dsgb10/convert/engram/engram_hashmap.bin}
-ENGRAM=${ENGRAM:-~/dsgb10/convert/engram}
+HASHMAP=${HASHMAP:-'~/dsgb10/convert/engram/engram_hashmap.bin'}
+ENGRAM=${ENGRAM:-'~/dsgb10/convert/engram'}
 SPILL=${SPILL:-~/dsgb10/spill}
 
 OUT=./fleet.conf PRINT=0 FORCE=0 PROBE=0
@@ -75,6 +75,8 @@ read -r -a W <<< "${WORKERS:-${WORKER:-}}"
 
 # A value from the environment if set, else the generated one.
 pick() { local v="RANK$1_$2"; printf '%s' "${!v:-$3}"; }
+# The per-rank paths carry a {rank} slot, so one pattern fits every rank.
+ranked() { local v; v=$(pick "$1" "$2" "$3"); printf '%s' "${v//\{rank\}/$1}"; }
 
 L=()
 add() { L+=("$1=$2"); }
@@ -108,9 +110,9 @@ for ((r = 0; r < TP; r++)); do
     add "RANK${r}_NEXT_IP${d}" "$(pick "$r" "NEXT_IP${d}" "192.168.$((LINK_BASE + 2 * next_link + d)).1")"
     add "RANK${r}_PREV_IP${d}" "$(pick "$r" "PREV_IP${d}" "192.168.$((LINK_BASE + 2 * prev_link + d)).2")"
   done
-  add "RANK${r}_WEIGHTS" "$(pick "$r" WEIGHTS "$WEIGHTS")"
-  add "RANK${r}_HASHMAP" "$(pick "$r" HASHMAP "$HASHMAP")"
-  add "RANK${r}_ENGRAM" "$(pick "$r" ENGRAM "$ENGRAM")"
+  add "RANK${r}_WEIGHTS" "$(ranked "$r" WEIGHTS "$WEIGHTS")"
+  add "RANK${r}_HASHMAP" "$(ranked "$r" HASHMAP "$HASHMAP")"
+  add "RANK${r}_ENGRAM" "$(ranked "$r" ENGRAM "$ENGRAM")"
   add "RANK${r}_ENGRAM_READ_BATCH" "$(pick "$r" ENGRAM_READ_BATCH 1)"
   add "RANK${r}_SPILL" "$(pick "$r" SPILL "$SPILL")"
 done
