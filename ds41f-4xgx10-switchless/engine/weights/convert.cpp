@@ -2,6 +2,7 @@
 //
 //   dsw_convert --ckpt DIR --rank R --out FILE [--world 4] [--threads 8] [--mem-gib 6]
 //   dsw_convert --ckpt DIR --rank R --plan         print the partition and sizes only
+// The world defaults to $TP (engine/common/tp.h); --world/--tp overrides it.
 //
 // Reads with O_DIRECT (no page-cache build-up), one output tensor per task, bounded memory, and
 // writes FILE.tmp with O_DIRECT, renaming it to FILE once the TOC and header are in place. Tensors
@@ -18,6 +19,7 @@
 #include <mutex>
 #include <thread>
 
+#include "common/tp.h"
 #include "kernels/dsk.h"
 #include "weights/io.h"
 #include "weights/layout.h"
@@ -167,7 +169,7 @@ void print_plan(const Plan& plan) {
 
 int main(int argc, char** argv) {
   std::string ckpt, out, only;
-  int rank = -1, world = 4, threads = 8;
+  int rank = -1, world = tp::world(), threads = 8;  // TP=4 unless $TP says otherwise
   double mem_gib = 6;
   bool plan_only = false, coverage = true;
   for (int i = 1; i < argc; i++) {
@@ -179,7 +181,7 @@ int main(int argc, char** argv) {
     if (a == "--ckpt") ckpt = next();
     else if (a == "--out") out = next();
     else if (a == "--rank") rank = std::stoi(next());
-    else if (a == "--world") world = std::stoi(next());
+    else if (a == "--world" || a == "--tp") world = std::stoi(next());
     else if (a == "--threads") threads = std::stoi(next());
     else if (a == "--mem-gib") mem_gib = std::stod(next());
     else if (a == "--plan") plan_only = true;
@@ -188,7 +190,9 @@ int main(int argc, char** argv) {
     else die("unknown argument %s", a.c_str());
   }
   if (ckpt.empty() || rank < 0 || (!plan_only && out.empty()))
-    die("usage: dsw_convert --ckpt DIR --rank R (--out FILE | --plan) [--world 4] [--threads 8] [--mem-gib 6]");
+    die("usage: dsw_convert --ckpt DIR --rank R (--out FILE | --plan) [--world N] [--threads 8] [--mem-gib 6]");
+  if (world < 1 || world > 16) die("--world %d: a world size is 1..16 (TP=%d)", world, tp::world());
+  if (rank >= world) die("--rank %d of --world %d: ranks are 0..%d", rank, world, world - 1);
 
   double t0 = now_s();
   Checkpoint ck = Checkpoint::open(ckpt);

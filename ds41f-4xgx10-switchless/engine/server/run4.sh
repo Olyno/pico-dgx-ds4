@@ -20,6 +20,11 @@ NAME=dsgb10_rank
 BIN=${BIN:-$(dirname "$0")/../build/server/$NAME}
 T=${TIMEOUT:-3600}
 . "$(dirname "$0")/ringlock.sh"  # the fleet file (fleet.sh) and the ring lock
+# A ring job is the four-box job: TP=4 (the engine's world) and its three workers.
+[ "${#FLEET_WORKERS[@]}" -eq 3 ] || {
+  echo "run4.sh: needs TP=4 (ranks 0-3, three workers); this fleet/TP gives ${#FLEET_WORKERS[@]}" >&2
+  exit 2
+}
 W1=$FLEET_RANK1_SSH W2=$FLEET_RANK2_SSH W3=$FLEET_RANK3_SSH  # ranks 1, 2, 3
 # the binaries' and the logs' directories as written, for the workers' shells (a leading ~/ is theirs);
 # here, expanded

@@ -5,7 +5,8 @@
 FLEET=${FLEET:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/fleet/homelab.conf}
 
 # fleet_load FILE: every key as FLEET_<KEY> (FLEET_GID_INDEX, FLEET_RANK1_SSH, ...), and FLEET_WORKERS:
-# ranks 1-3's SSH addresses. 1, saying why on stderr, if FILE is not a fleet file the scripts can use.
+# ranks 1..TP-1's SSH addresses (TP from the environment, 4 by default). 1, saying why on stderr, if
+# FILE is not a fleet file the scripts can use.
 fleet_load() {
   local f=$1 line n=0 key val k v
   local skip='^[[:blank:]]*(#.*)?$' re='^([A-Z][A-Z0-9_]*)=([A-Za-z0-9._/~:,@+%{}-]*)([[:blank:]]+(#.*)?)?$'
@@ -35,14 +36,28 @@ fleet_load() {
     seen[$key]=$n
     printf -v "FLEET_$key" '%s' "$val"
   done < "$f"
-  for k in BIN_DIR LOG_DIR SERVICE_DIR RING_LOCK RANK1_SSH RANK2_SSH RANK3_SSH; do
+  # TP (default 4) is the tensor-parallel degree: ranks 0..TP-1, so TP-1 workers.
+  local tp=${TP:-${DSGB10_TP:-4}} r
+  [[ $tp =~ ^[1-9][0-9]*$ ]] || {
+    echo "fleet: TP='$tp' is not a positive integer" >&2
+    return 1
+  }
+  for k in BIN_DIR LOG_DIR SERVICE_DIR RING_LOCK; do
     v="FLEET_$k"
     if [ -z "${!v:-}" ]; then
       echo "fleet: $f: no $k" >&2
       return 1
     fi
   done
-  FLEET_WORKERS=("$FLEET_RANK1_SSH" "$FLEET_RANK2_SSH" "$FLEET_RANK3_SSH")
+  FLEET_WORKERS=()
+  for ((r = 1; r < tp; r++)); do
+    v="FLEET_RANK${r}_SSH"
+    if [ -z "${!v:-}" ]; then
+      echo "fleet: $f: no RANK${r}_SSH (TP=$tp: ranks 0..$((tp - 1)))" >&2
+      return 1
+    fi
+    FLEET_WORKERS+=("${!v}")
+  done
 }
 
 # fleet_get KEY: a key's value as written ("" if the file has none), for keys made from a rank:

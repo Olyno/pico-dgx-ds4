@@ -5,6 +5,10 @@
 
 namespace model {
 
+// The tensor-parallel degree. Every per-rank shape below derives from it, so this is the one
+// constant a TP generalisation starts from; the kernels' launch shapes and the ring's relay
+// topology (opposite rank (r+2)%kRanks, quarter reduce-scatter) assume 4 today, which is why
+// $TP != 4 is refused at startup (engine/common/tp.h).
 constexpr int kRanks = 4;
 constexpr int kLayers = 40;
 constexpr int kDim = 5120;

@@ -230,7 +230,9 @@ start_engine() {  # strays out, the model files' page cache dropped, memory chec
   r=1
   for w in "${WS[@]}"; do
     old=$(for ((i = KEEP - 1; i >= 1; i--)); do echo -n "$i "; done)
-    "${SSH[@]}" "$w" "cd $RH && f=logs/rank.$r.log && if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi; setsid nohup bin/$NAME --rank $r $ARGS >> \$f 2>&1 < /dev/null &" ||
+    # TP goes on the worker's command line: ssh does not forward this environment, and every rank must
+    # agree on the world (tp::require_engine).
+    "${SSH[@]}" "$w" "cd $RH && f=logs/rank.$r.log && if [ -s \$f ]; then for i in $old; do [ -f \$f.\$i ] && mv -f \$f.\$i \$f.\$((i + 1)); done; mv -f \$f \$f.1; fi; setsid nohup env TP=${TP:-4} bin/$NAME --rank $r $ARGS >> \$f 2>&1 < /dev/null &" ||
       {
         log "starting rank $r on $w failed"
         reap_all 0

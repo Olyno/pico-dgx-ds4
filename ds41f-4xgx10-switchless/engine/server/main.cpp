@@ -123,6 +123,7 @@
 #include "comm/ring.h"
 #include "common/check.h"
 #include "common/keepfile.h"
+#include "common/tp.h"
 #include "dspark/dspark.h"
 #include "engram/engram.h"
 #include "model/model.h"
@@ -568,6 +569,7 @@ void mem_report(int rank, const char* when) {
 
 int main(int argc, char** argv) {
   setvbuf(stdout, nullptr, _IOLBF, 0);
+  tp::require_engine(comm::kRanks, "dsgb10_rank");  // TP != 4 dies here, before the fleet or weights
   const Args a = parse(argc, argv);
   const double t0 = now_s();
   std::printf("rank %d (%s): the fleet file %s; weights %s", a.rank, comm::fleet(a.fleet).rank[a.rank].name.c_str(),
@@ -607,7 +609,7 @@ int main(int argc, char** argv) {
   }
   std::printf("rank %d: ring up after %.1f s\n", a.rank, now_s() - t0);
   // 3. weights (the DSpark blocks with --spec)
-  dsw::WeightFile wf(a.weights, a.rank, comm::kRanks);  // refuses another rank's file
+  dsw::WeightFile wf(a.weights, a.rank, tp::world());  // refuses another rank's file, or another TP's
   dsw::LoadOptions lo;
   lo.threads = a.threads;
   lo.select = [&a](const dsw::DeviceTensor& t) {
@@ -626,7 +628,7 @@ int main(int argc, char** argv) {
   // stay the model's. Drafts change the speed, never the tokens.
   std::unique_ptr<dsw::WeightFile> dwf;
   if (a.spec && !a.draft_weights.empty()) {
-    dwf = std::make_unique<dsw::WeightFile>(a.draft_weights, a.rank, comm::kRanks);
+    dwf = std::make_unique<dsw::WeightFile>(a.draft_weights, a.rank, tp::world());
     dsw::LoadOptions dlo;
     dlo.threads = a.threads;
     dlo.select = [](const dsw::DeviceTensor& t) { return t.name.rfind("mtp.", 0) == 0; };
