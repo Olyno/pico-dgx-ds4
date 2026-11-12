@@ -20,7 +20,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   && rm -rf /var/lib/apt/lists/* \
   && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
        | sh -s -- -y --profile minimal --default-toolchain 1.97 \
-  && cargo --version
+  && cargo --version \
+  && python3 -m pip install --break-system-packages --no-cache-dir huggingface_hub \
+  && (command -v hf || command -v huggingface-cli)
 
 WORKDIR /work
 

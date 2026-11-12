@@ -9,6 +9,8 @@
 #   ./start.sh restart         stop, then start
 #   ./start.sh status          exit 0 serving, 1 not
 #   ./start.sh fleet           write the fleet file from TP + WORKERS (fleet/gen-fleet.sh)
+#   ./start.sh prepare         one-time on rank 0: download the checkpoint if missing, then
+#                              cut each rank's .dsw and its Engram shards (--no-download skips the fetch)
 #   ./start.sh --help
 #   DRY_RUN=1 ./start.sh       print the docker command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
@@ -56,9 +58,88 @@ in_container() {
   esac
 }
 
+ensure_image() {
+  if [ "${SKIP_BUILD:-0}" = "1" ]; then
+    log "SKIP_BUILD=1: using existing image $IMAGE"
+  elif [ "$DRY" = "1" ]; then
+    log "DRY_RUN: docker build -t $IMAGE -f Dockerfile . (not run)"
+  else
+    log "Building $IMAGE (engine + front-end, sm_121a)..."
+    docker build -t "$IMAGE" -f Dockerfile .
+  fi
+  docker image inspect "$IMAGE" >/dev/null 2>&1 || {
+    [ "$DRY" = "1" ] && warn "DRY_RUN: image $IMAGE missing" || die "image $IMAGE missing (build without SKIP_BUILD=1)"
+  }
+}
+
+# One-time setup on rank 0: the checkpoint (if missing), then each rank's .dsw and
+# its Engram shards, all with the image's own binaries. Serving needs those
+# artefacts and a tokenizer.json, not the checkpoint itself.
+prepare() {
+  local ckpt=${CKPT:-$HOME/DeepSeek-V4.1-Flash-1017}
+  local out=${PREPARE_OUT:-$HOME/dsgb10/convert}
+  local repo=${HF_REPO:-deepseek-ai/DeepSeek-V4.1-Flash-1017} rev=${HF_REV:-1bae0e10}
+  local nodl=0 a r
+  for a in "$@"; do
+    case $a in
+      --no-download) nodl=1 ;;
+      *) die "prepare: unknown argument $a" ;;
+    esac
+  done
+  for a in "$ckpt" "$out"; do
+    case "$a" in
+      "$HOME"/*|/data/*) ;;
+      *) die "keep CKPT and PREPARE_OUT under \$HOME or /data (the container mounts only those): $a" ;;
+    esac
+  done
+  [ "$DRY" = "1" ] || [ -e /dev/nvidia0 ] ||
+    die "prepare needs the GB10 GPU (dsw_convert tiles on it): run it on rank 0, the head"
+  local ckpt_in out_in
+  ckpt_in=$(in_container "$ckpt") out_in=$(in_container "$out")
+
+  prep_exec() {  # what; shell in the image
+    log "$1"
+    [ "$DRY" = "1" ] && { echo "    $2"; return 0; }
+    docker run --rm --gpus all --ipc=host --network host -v "$HOME:/root" -v /data:/data \
+      ${HF_TOKEN:+-e HF_TOKEN} "$IMAGE" bash -lc "cd /work/ds41f-4xgx10-switchless && $2" ||
+      die "prepare: '$1' failed"
+  }
+
+  if [ "$nodl" = 1 ]; then
+    log "prepare: --no-download, using $ckpt"
+  elif [ -f "$ckpt/config.json" ]; then
+    log "prepare: checkpoint present at $ckpt"
+  else
+    prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable)" \
+      "command -v hf >/dev/null && hf download $repo --revision $rev --local-dir $ckpt_in || huggingface-cli download $repo --revision $rev --local-dir $ckpt_in"
+  fi
+  for ((r = 0; r < TP; r++)); do
+    prep_exec "cut rank $r of $TP" \
+      "engine/build/weights/dsw_convert --ckpt $ckpt_in --rank $r --world $TP --out $out_in/rank$r.dsw"
+    prep_exec "verify rank $r" \
+      "engine/build/weights/dsw_verify --ckpt $ckpt_in --file $out_in/rank$r.dsw --threads 4"
+  done
+  for ((r = 0; r < TP; r++)); do
+    prep_exec "pack rank $r's Engram shards" \
+      "engine/build/engram/engram_pack $ckpt_in $out_in/engram $r"
+  done
+  prep_exec "write the Engram hash map" \
+    "python3 engine/engram/py/make_hashmap_stdlib.py $ckpt_in $out_in/engram/engram_hashmap.bin"
+
+  log "done: rank files and engram/ under $out"
+  log "install rank 0's files where the fleet file says, then copy the rest:"
+  echo "    cp $out/rank0.dsw <RANK0_WEIGHTS>; cp -r $out/engram/* <RANK0_ENGRAM>/; cp $out/engram/engram_hashmap.bin <RANK0_HASHMAP>"
+  for ((r = 1; r < TP; r++)); do
+    echo "    rsync -h --progress $out/rank$r.dsw <RANK${r}_SSH>:<RANK${r}_WEIGHTS>"
+    echo "    rsync -h --progress $out/engram/engram-l*-r${r}of4.bin <RANK${r}_SSH>:<RANK${r}_ENGRAM>/"
+    echo "    rsync -h --progress $out/engram/engram_hashmap.bin <RANK${r}_SSH>:<RANK${r}_HASHMAP>"
+  done
+  log "then: ./start.sh"
+}
+
 MODE=start
 case "${1:-}" in
-  start | restart | status | fleet) MODE=$1; shift ;;
+  start | restart | status | fleet | prepare) MODE=$1; shift ;;
   -h | --help | help) usage; exit 0 ;;
 esac
 for arg in "$@"; do
@@ -91,17 +172,11 @@ if [ "$MODE" = "status" ]; then
 fi
 
 # ---------------------------------------------------------------- 1. image
-if [ "${SKIP_BUILD:-0}" = "1" ]; then
-  log "SKIP_BUILD=1: using existing image $IMAGE"
-elif [ "$DRY" = "1" ]; then
-  log "DRY_RUN: docker build -t $IMAGE -f Dockerfile . (not run)"
-else
-  log "Building $IMAGE (engine + front-end, sm_121a)..."
-  docker build -t "$IMAGE" -f Dockerfile .
+ensure_image
+if [ "$MODE" = "prepare" ]; then
+  prepare "$@"
+  exit 0
 fi
-docker image inspect "$IMAGE" >/dev/null 2>&1 || {
-  [ "$DRY" = "1" ] && warn "DRY_RUN: image $IMAGE missing" || die "image $IMAGE missing (build without SKIP_BUILD=1)"
-}
 
 # ---------------------------------------------------------------- 2. files
 if [ "$NO_AUTH" = "1" ]; then
@@ -133,8 +208,18 @@ if [ ! -f "$CF" ]; then
       log "deployed the confidence-gate weights to $CF"
   fi
 fi
-if [ -n "${CKPT:-}" ] && [ ! -d "$CKPT" ]; then
-  die "checkpoint $CKPT not found (deepseek-ai/DeepSeek-V4.1-Flash or DeepSeek-V4.1-Flash-1017)"
+# Serving needs the tokenizer, not the 510 GB checkpoint: the rank files and the
+# Engram shards are cut from the checkpoint once (`./start.sh prepare`).
+TOKENIZER="${TOKENIZER:-}"
+if [ -z "$TOKENIZER" ]; then
+  for c in "${CKPT:+$CKPT/tokenizer.json}" "$HOME/DeepSeek-V4.1-Flash/tokenizer.json" \
+    "$HOME/DeepSeek-V4.1-Flash-1017/tokenizer.json" /data/models/DeepSeek-V4.1-Flash/tokenizer.json; do
+    if [ -n "$c" ] && [ -f "$c" ]; then TOKENIZER=$c && break; fi
+  done
+fi
+if [ -z "$TOKENIZER" ]; then
+  [ "$DRY" = "1" ] && warn "DRY_RUN: no tokenizer.json found under CKPT or ~/DeepSeek-V4.1-Flash*" ||
+    die "no tokenizer.json found: set CKPT to a checkpoint dir (or TOKENIZER=FILE); ./start.sh prepare downloads one"
 fi
 
 # ---------------------------------------------------------------- 3. previous
@@ -181,7 +266,7 @@ if [ "$GATE_ON" = 1 ]; then
 fi
 [ -n "${DSGB10_RING_DIRECT:-}" ] && EARGS+=" --setenv DSGB10_RING_DIRECT=$DSGB10_RING_DIRECT"
 [ $# -gt 0 ] && EARGS+=" $*"
-FARGS="${DSGB10_FRONT_ARGS:---tokenizer $(in_container "${CKPT:-$HOME/DeepSeek-V4.1-Flash}")/tokenizer.json --model-name deepseek-v4.1-flash}"
+FARGS="${DSGB10_FRONT_ARGS:---tokenizer $(in_container "${TOKENIZER:-$HOME/DeepSeek-V4.1-Flash/tokenizer.json}") --model-name deepseek-v4.1-flash}"
 
 run_args=(
   --name "$CONTAINER" --gpus all --network host --ipc=host

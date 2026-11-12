@@ -153,6 +153,7 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 ```bash
 cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, CKPT, port
 ./start.sh fleet                         # write the fleet file from TP + WORKERS (no hand-editing)
+./start.sh prepare                       # once, rank 0: checkpoint download + rank files + Engram shards
 ./start.sh                               # docker build + service start + smoke test
 ./start.sh status                        # exit 0 while serving
 ./stop.sh                                # graceful stop, then remove the container
@@ -161,6 +162,11 @@ cp .env.example .env && $EDITOR .env     # TP=4, WORKERS, CKPT, port
 `./start.sh fleet` derives the rank count, per-rank paths and the ring's link addresses from `TP` and
 `WORKERS="user@host ..."` (`fleet/gen-fleet.sh`); only the RDMA device names and `GID_INDEX` stay inputs. The API key
 is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
+
+`./start.sh prepare` is the one-time setup on rank 0: it downloads the checkpoint (unless `CKPT/config.json` is
+already there), cuts each rank's `.dsw` with `dsw_convert --world $TP`, verifies it, packs the Engram shards and writes
+the hash map, then prints the copy commands for the worker boxes. `start` needs those artefacts plus a
+`tokenizer.json` — not the checkpoint — so it never downloads anything by itself.
 
 The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
 work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.
