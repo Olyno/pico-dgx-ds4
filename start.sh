@@ -19,10 +19,10 @@
 #       --source S        local | hybrid | http (the default takes the local one)
 #   DRY_RUN=1 ./start.sh  print every command, change nothing
 #
-# Settings come from ./.env: FLEET (the rank list and the paths) and, if the fleet
-# is not written yet, WORKERS (the other boxes). The rank count is not a setting:
-# rank 0 is the head and every ssh target in WORKERS is one more, so the fleet's
-# four ranks are what `./start.sh` cuts. The engine loads world 4 only today
+# Settings come from ./.env: DSGB10_PORT, DSGB10_ADDR (the API), DSGB10_MODEL (the
+# name it answers to). The rank list is FLEET, and it is the rank count: rank 0 is
+# the head and every other box the file names is one more rank. WORKERS only
+# writes that file when it does not exist. The engine loads world 4 only today
 # (engine/common/tp.h); the cutter takes the worlds the model allows, 1, 2 and 4.
 #
 # The artifacts live where the fleet puts rank 0's weight file (RANK0_WEIGHTS):
@@ -100,15 +100,15 @@ if [ -f "$FLEET" ]; then
   [ -n "${last:-}" ] && fleet_ranks=$((last + 1))
 fi
 derived_tp=0
-if [ "${#_WORKERS[@]}" -gt 0 ]; then
-  derived_tp=$((${#_WORKERS[@]} + 1))
-  # A WORKERS copied from another setup overrides the fleet without a word, which
-  # is how a four-box fleet ends up cut for two. Say it.
-  if [ "$fleet_ranks" -gt 0 ] && [ "$fleet_ranks" != "$derived_tp" ]; then
-    warn "WORKERS names $derived_tp rank(s), $FLEET names $fleet_ranks: WORKERS wins and ranks $derived_tp..$((fleet_ranks - 1)) are ignored (unset WORKERS to use the fleet's $fleet_ranks)"
-  fi
-elif [ "$fleet_ranks" -gt 0 ]; then
+if [ "$fleet_ranks" -gt 0 ]; then
+  # Once the rank list exists it is the truth; WORKERS only writes it when it is
+  # missing. Two lists that disagree is how a four-box fleet gets cut for two.
   derived_tp=$fleet_ranks
+  if [ "${#_WORKERS[@]}" -gt 0 ] && [ "${#_WORKERS[@]}" -ne "$((fleet_ranks - 1))" ]; then
+    warn "$FLEET names $fleet_ranks ranks, so WORKERS is not used (it only writes a missing fleet): remove it, or delete $FLEET to rebuild it from WORKERS"
+  fi
+elif [ "${#_WORKERS[@]}" -gt 0 ]; then
+  derived_tp=$((${#_WORKERS[@]} + 1))
 fi
 [ "$derived_tp" -gt 0 ] || derived_tp=4
 # There is no TP to set: the boxes you name are the rank count, and the engine is
@@ -504,7 +504,11 @@ if [ "$GATE_ON" = 1 ]; then
 fi
 [ -n "${DSGB10_RING_DIRECT:-}" ] && EARGS+=" --setenv DSGB10_RING_DIRECT=$DSGB10_RING_DIRECT"
 [ $# -gt 0 ] && EARGS+=" $*"
-FARGS="${DSGB10_FRONT_ARGS:---tokenizer $(in_container "${TOKENIZER:-$HOME/DeepSeek-V4.1-Flash/tokenizer.json}") --model-name deepseek-v4.1-flash}"
+if [ -n "${DSGB10_FRONT_ARGS:-}" ]; then
+  FARGS="$DSGB10_FRONT_ARGS"
+else
+  FARGS="--tokenizer $(in_container "${TOKENIZER:-$HOME/DeepSeek-V4.1-Flash/tokenizer.json}") --model-name ${DSGB10_MODEL:-deepseek-v4.1-flash}"
+fi
 # VISION=1 accepts image parts; without the address dsfront refuses them as before.
 if [ "$VISION" = "1" ]; then
   case "$FARGS" in

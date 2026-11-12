@@ -150,8 +150,8 @@ Design, protocol and the full numbers: [docs/vision.md](ds41f-4xgx10-switchless/
 shards and the hash map, ships the other ranks' three files to the boxes the fleet names, starts
 `engine/server/service.sh` inside a host-networked GPU container, waits until the API answers and runs a smoke test.
 `./stop.sh` stops it and frees the GPU. Run it again after an interruption: finished ranks are kept, unfinished ones
-resume, nothing is asked. Settings come from `.env` (see [.env.example](.env.example)): `FLEET`, and `WORKERS` only
-when the fleet file does not exist yet.
+resume, nothing is asked. Settings come from `.env` (see [.env.example](.env.example)): the port, the bind address and
+the name the API answers to. The rank list is the fleet file, which `WORKERS` writes when it does not exist yet.
 
 ```bash
 cp .env.example .env && $EDITOR .env     # FLEET; WORKERS if the fleet is not written yet
@@ -160,10 +160,11 @@ cp .env.example .env && $EDITOR .env     # FLEET; WORKERS if the fleet is not wr
 ./stop.sh                                # graceful stop, then remove the container
 ```
 
-The rank count is the box list, not a setting: rank 0 is the head and every `WORKERS` target is one more rank, so
-three targets are the four-rank ring. `fleet/gen-fleet.sh` writes the fleet file from it on the first run — per-rank
-paths and the ring's link addresses included; only the RDMA device names and `GID_INDEX` stay inputs. The API key
-is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network only).
+The rank list is [`fleet/homelab.conf`](ds41f-4xgx10-switchless/fleet/homelab.conf) — rank 0 plus the boxes it names —
+and it is what the rank count comes from: there is no TP to set. If that file is missing, `fleet/gen-fleet.sh` writes it
+from `WORKERS` (per-rank paths and the ring's link addresses included; only the RDMA device names and `GID_INDEX` stay
+inputs). The API key is generated on first start; `DSGB10_NO_AUTH=1` serves without one (loopback or a trusted network
+only — with `DSGB10_ADDR=0.0.0.0` that is an open endpoint).
 
 The cutting is done by `dsw-prepare` (`ds41f-4xgx10-switchless/prepare`, Rust, CPU only — it does not need the GPU),
 which `./start.sh` runs by itself and only when a rank's files are not already in place. It looks for the checkpoint in
