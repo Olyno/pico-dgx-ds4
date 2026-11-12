@@ -97,11 +97,16 @@ prepare() {
   local ckpt_in out_in
   ckpt_in=$(in_container "$ckpt") out_in=$(in_container "$out")
 
+  # Xet's writer thread is what fails on some bind mounts ("Background writer
+  # channel closed"); the plain HTTP path is slower and reliable. HF_XET=1 re-enables it.
+  local xet=${HF_HUB_DISABLE_XET:-1}
+  [ -n "${HF_XET:-}" ] && xet=0
   prep_exec() {  # what; shell in the image
     log "$1"
     [ "$DRY" = "1" ] && { echo "    $2"; return 0; }
     docker run --rm --gpus all --ipc=host --network host -v "$HOME:/root" -v /data:/data \
-      ${HF_TOKEN:+-e HF_TOKEN} "$IMAGE" bash -lc "cd /work/ds41f-4xgx10-switchless && $2" ||
+      -e "HF_HUB_DISABLE_XET=$xet" ${HF_TOKEN:+-e HF_TOKEN} \
+      "$IMAGE" bash -lc "cd /work/ds41f-4xgx10-switchless && $2" ||
       die "prepare: '$1' failed"
   }
 
@@ -110,8 +115,19 @@ prepare() {
   elif [ -f "$ckpt/config.json" ]; then
     log "prepare: checkpoint present at $ckpt"
   else
-    prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable)" \
-      "command -v hf >/dev/null && hf download $repo --revision $rev --local-dir $ckpt_in || huggingface-cli download $repo --revision $rev --local-dir $ckpt_in"
+    # The checkpoint is ~510 GB: fail before a long download that cannot finish.
+    local dir free_gb
+    dir=$(dirname "$ckpt")
+    while [ ! -d "$dir" ] && [ "$dir" != / ]; do dir=$(dirname "$dir"); done
+    free_gb=$(df -Pk "$dir" | awk 'NR == 2 { printf "%d", $4 / 1048576 }')
+    if [ "${free_gb:-0}" -lt "${NEED_GB:-520}" ]; then
+      [ "$DRY" = "1" ] && warn "DRY_RUN: only ${free_gb:-?} GiB free on $dir (the checkpoint needs ~510)" ||
+        die "only ${free_gb:-?} GiB free on $dir; the checkpoint needs ~510 GiB (NEED_GB=N to override)"
+    fi
+    # hf (huggingface_hub >= 0.27) or the older CLI, chosen once: a `||` chain
+    # would mask a failed download as "command not found".
+    prep_exec "download $repo @ $rev into $ckpt (~510 GB, resumable, xet off)" \
+      "if command -v hf >/dev/null 2>&1; then hf download $repo --revision $rev --local-dir $ckpt_in; else huggingface-cli download $repo --revision $rev --local-dir $ckpt_in; fi"
   fi
   for ((r = 0; r < TP; r++)); do
     prep_exec "cut rank $r of $TP" \
