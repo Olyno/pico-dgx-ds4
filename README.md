@@ -203,6 +203,16 @@ per shard — tensors done, bytes written, bytes released, elapsed and an estima
 10 %. `dsw-prepare status --out DIR` prints each rank's commits, and `dsw-prepare verify --ckpt DIR --file FILE`
 re-derives every tensor from the TOC's own description and compares it with the checkpoint.
 
+**Another split (experimental).** `./start.sh reshard --world 2` re-cuts a finished set for a different tensor-parallel
+degree using the rank files alone: no checkpoint, no download, no GPU (the container runs with `--network none`). It
+reads each old rank's tiled bytes, un-tiles them, copies the rectangles the new split owns, tiles those with the new
+geometry and reads every tensor back before the file is renamed into place; the old Engram shards are re-cut the same way,
+by rows. `--from`/`--to` default to `~/dsgb10/convert` and `~/dsgb10/convert-tpN`, and a 4 → 2 → 4 round trip reproduces
+the original files tensor for tensor.
+
+The engine itself serves TP=4 only (`engine/common/tp.h`), so the output of a reshard is for a build whose kernels and
+ring take that world; what exists today is the files, and their bytes are the checkpoint's own.
+
 The container runs with `--network host` and `/dev/infiniband` so the ConnectX-7 ring and the fleet file's addresses
 work unchanged; `$HOME` is mounted at `/root` and `/data` at `/data`, so the fleet's `~/` and `/data` paths resolve.
 `service.sh` still copies the engine binary and the confidence-gate weights to ranks 1..TP−1 over ssh, so those boxes

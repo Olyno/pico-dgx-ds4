@@ -74,7 +74,7 @@ pub fn consume_peak(ck: &crate::safetensors::Checkpoint, world: u32, ranks: &[u3
     let mut written_at = vec![0u64; n];
     let mut released_at = vec![0usize; n];
     for &r in ranks {
-        let p = crate::plan::make_plan(ck, r, world).map_err(|e| format!("rank {r}: {e}"))?;
+        let p = crate::plan::make_plan(&ck.tensors, r, world).map_err(|e| format!("rank {r}: {e}"))?;
         for t in &p.tensors {
             let last = t.pieces.iter().map(|pc| ck.tensors[pc.src].shard).max().unwrap_or(0);
             written_at[last] = written_at[last].saturating_add(t.bytes);
@@ -90,7 +90,7 @@ pub fn consume_peak(ck: &crate::safetensors::Checkpoint, world: u32, ranks: &[u3
         for t in crate::engram::tables(ck)? {
             let s = ck.tensors[t.weight].shard;
             for &r in ranks {
-                written_at[s] = written_at[s].saturating_add(crate::engram::shard_bytes(&t, r));
+                written_at[s] = written_at[s].saturating_add(crate::engram::shard_bytes(&t, r, world));
             }
             released_at[s] = released_at[s].max(s);
         }

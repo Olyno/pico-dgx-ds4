@@ -36,6 +36,7 @@ pub mod dsw;
 pub mod engram;
 pub mod journal;
 pub mod plan;
+pub mod reshard;
 pub mod safetensors;
 pub mod source;
 pub mod space;

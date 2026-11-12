@@ -79,7 +79,7 @@ pub fn journal_path(o: &Options, rank: u32) -> PathBuf {
 }
 
 pub fn engram_path(o: &Options, rank: u32, layer: u32) -> PathBuf {
-    dir_for(o, rank).join("engram").join(engram::shard_name(layer, rank))
+    dir_for(o, rank).join("engram").join(engram::shard_name(layer, rank, o.world))
 }
 
 fn part(path: &Path) -> PathBuf {
@@ -158,14 +158,14 @@ fn read_tensor(reader: &dyn Reader, t: &SrcTensor) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn write_padded(file: &File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_padded(file: &File, offset: u64, bytes: &[u8]) -> std::io::Result<()> {
     let padded = align_up(bytes.len() as u64, ALIGN) as usize;
     let mut buf = vec![0u8; padded];
     buf[..bytes.len()].copy_from_slice(bytes);
     file.write_all_at(&buf, offset)
 }
 
-fn read_padded(file: &File, offset: u64, bytes: u64) -> std::io::Result<Vec<u8>> {
+pub(crate) fn read_padded(file: &File, offset: u64, bytes: u64) -> std::io::Result<Vec<u8>> {
     let padded = align_up(bytes, ALIGN) as usize;
     let mut buf = vec![0u8; padded];
     file.read_exact_at(&mut buf, offset)?;
@@ -240,7 +240,7 @@ fn finalise(rs: &mut RankState, out: &Path, model: &str, source_note: &str) -> R
 
 /// Opens (or resumes) one rank's output file and journal.
 fn open_rank(ck: &Checkpoint, o: &Options, rank: u32) -> Result<RankState, String> {
-    let plan = plan::make_plan(ck, rank, o.world)?;
+    let plan = plan::make_plan(&ck.tensors, rank, o.world)?;
     let out = dsw_path(o, rank);
     if let Some(d) = out.parent() {
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
@@ -435,7 +435,7 @@ pub fn run(ck: &Checkpoint, reader: &dyn Reader, o: &Options, source_note: &str)
                         outputs: vec![OutputCommit {
                             path: engram_path(o, st.rank, table.layer).display().to_string(),
                             offset: 0,
-                            len: engram::shard_bytes(table, st.rank),
+                            len: engram::shard_bytes(table, st.rank, o.world),
                             crc32c: 0,
                         }],
                     })
@@ -559,7 +559,7 @@ fn write_engram(ck: &Checkpoint, st: &mut RankState, table: &Table, reader: &dyn
         std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
     }
     let tmp = part(&path);
-    let (lo, hi) = engram::rows_of(table, st.rank);
+    let (lo, hi) = engram::rows_of(table, st.rank, o.world);
     let w = &ck.tensors[table.weight];
     let s = &ck.tensors[table.scale];
     let f = OpenOptions::new()

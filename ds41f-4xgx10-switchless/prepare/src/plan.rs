@@ -382,13 +382,13 @@ fn block_of(t: &SrcTensor) -> Result<(u64, u64, u64), String> {
 
 /// A scale must be cut exactly along the weight's blocks: same pieces, divided by
 /// the block size, and its own shape must be the weight's in blocks.
-fn check_scale_pair(ck: &Checkpoint, w: &OutTensor, s: &OutTensor) -> Result<(), String> {
+fn check_scale_pair(tensors: &[SrcTensor], w: &OutTensor, s: &OutTensor) -> Result<(), String> {
     if w.pieces.len() != s.pieces.len() {
         return Err(format!("{} and its scale have different piece counts", w.name));
     }
     for (pw, ps) in w.pieces.iter().zip(&s.pieces) {
-        let wt = &ck.tensors[pw.src];
-        let st = &ck.tensors[ps.src];
+        let wt = &tensors[pw.src];
+        let st = &tensors[ps.src];
         if st.dtype != DType::F8E8M0 {
             return Err(format!("{}: scale dtype {}", st.name, st.dtype));
         }
@@ -420,7 +420,7 @@ fn check_scale_pair(ck: &Checkpoint, w: &OutTensor, s: &OutTensor) -> Result<(),
 /// Builds rank `rank`'s plan and lays it out. Fails on a tensor the table does
 /// not know, a dimension that does not divide, a slice that cuts through a scale
 /// block, or a shape that does not fit its tiled layout.
-pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String> {
+pub fn make_plan(tensors: &[SrcTensor], rank: u32, world: u32) -> Result<Plan, String> {
     if world < 1 || rank >= world {
         return Err(format!("bad rank {rank} / world {world}"));
     }
@@ -442,7 +442,7 @@ pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String>
     }
     let mut groups: BTreeMap<String, Group> = BTreeMap::new();
     let mut unknown = Vec::new();
-    for (idx, t) in ck.tensors.iter().enumerate() {
+    for (idx, t) in tensors.iter().enumerate() {
         if t.name.starts_with("vision.") || t.name.starts_with("aligner.") {
             plan.skipped.push(t.name.clone());
             continue;
@@ -476,7 +476,7 @@ pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String>
     for (out, g) in &mut groups {
         g.srcs.sort();
         let first_idx = g.srcs[0].1;
-        let first = &ck.tensors[first_idx];
+        let first = &tensors[first_idx];
         let dtype = dtype_of(first)?;
         let src_shape = first.shape.clone();
         let stacked = g.srcs[0].0 >= 0;
@@ -485,7 +485,7 @@ pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String>
                 if *expert != e as i64 {
                     return Err(format!("{out}: expert {e} missing"));
                 }
-                let t = &ck.tensors[*idx];
+                let t = &tensors[*idx];
                 if t.shape != first.shape || t.dtype != first.dtype {
                     return Err(format!("{out}: experts differ in shape or dtype"));
                 }
@@ -519,7 +519,7 @@ pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String>
         };
         let mut per = 0u64;
         for (e, (_expert, idx)) in g.srcs.iter().enumerate() {
-            let c = cut(&ck.tensors[*idx], *idx, g.rule, rank, world, per * e as u64)?;
+            let c = cut(&tensors[*idx], *idx, g.rule, rank, world, per * e as u64)?;
             if e == 0 {
                 per = c.bytes;
                 o.shape = c.shape.clone();
@@ -560,7 +560,7 @@ pub fn make_plan(ck: &Checkpoint, rank: u32, world: u32) -> Result<Plan, String>
         let (w, s) = (&plan.tensors[wi], &plan.tensors[i]);
         // The weight's source tensor decides the block size and the scale's must
         // be that shape in blocks; both are the checkpoint's, not the slice's.
-        check_scale_pair(ck, w, s)?;
+        check_scale_pair(tensors, w, s)?;
     }
 
     plan.tensors.sort_by(|a, b| {
@@ -593,7 +593,7 @@ pub fn check_coverage(ck: &Checkpoint, world: u32) -> Result<(), String> {
     let mut kind: HashMap<usize, SliceKind> = HashMap::new();
     let mut skipped = 0usize;
     for r in 0..world {
-        let p = make_plan(ck, r, world)?;
+        let p = make_plan(&ck.tensors, r, world)?;
         skipped = p.skipped.len();
         for o in &p.tensors {
             for pc in &o.pieces {
@@ -682,7 +682,7 @@ mod tests {
     #[test]
     fn rows_split_disjointly_and_cover_the_source() {
         let (dir, ck) = ck(&[("layers.0.attn.wq_b.weight", "F8_E4M3", &[2048, 64])]);
-        let plans: Vec<Plan> = (0..4).map(|r| make_plan(&ck, r, 4).unwrap()).collect();
+        let plans: Vec<Plan> = (0..4).map(|r| make_plan(&ck.tensors, r, 4).unwrap()).collect();
         for (r, p) in plans.iter().enumerate() {
             let o = &p.tensors[0];
             assert_eq!(o.kind, SliceKind::Rows);
@@ -699,7 +699,7 @@ mod tests {
     fn replicated_tensors_are_whole_on_every_rank() {
         let (dir, ck) = ck(&[("layers.0.attn_norm.weight", "BF16", &[64])]);
         for r in 0..4 {
-            let p = make_plan(&ck, r, 4).unwrap();
+            let p = make_plan(&ck.tensors, r, 4).unwrap();
             assert_eq!(p.tensors[0].kind, SliceKind::Replicated);
             assert_eq!(p.tensors[0].bytes, 128);
             assert_eq!(p.tensors[0].shape, vec![64]);
@@ -715,7 +715,7 @@ mod tests {
             ("layers.0.ffn.experts.0.w1.weight", "I8", &[64, 64]),
             ("layers.0.ffn.experts.1.w1.weight", "I8", &[64, 64]),
         ]);
-        let p = make_plan(&ck, 1, 4).unwrap();
+        let p = make_plan(&ck.tensors, 1, 4).unwrap();
         let o = p.tensors.iter().find(|t| t.name == "layers.0.ffn.experts.w1.weight").unwrap();
         assert_eq!(o.nstack, 3);
         assert_eq!(o.shape, vec![3, 16, 64]); // 64 rows / 4 ranks, three experts
@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn rows_seg_splits_each_segment() {
         let (dir, ck) = ck(&[("layers.0.engram.wkv.weight", "F8_E4M3", &[320, 16])]);
-        let p = make_plan(&ck, 0, 4).unwrap();
+        let p = make_plan(&ck.tensors, 0, 4).unwrap();
         let o = &p.tensors[0];
         assert_eq!(o.kind, SliceKind::RowsSeg);
         assert_eq!(o.nseg, 5);
@@ -755,7 +755,7 @@ mod tests {
             ("layers.0.attn_norm.weight", "BF16", &[8]),
             ("layers.0.attn.wq_b.weight", "F8_E4M3", &[64, 64]),
         ]);
-        let p = make_plan(&ck, 0, 4).unwrap();
+        let p = make_plan(&ck.tensors, 0, 4).unwrap();
         assert_eq!(p.toc_offset, 4096);
         assert_eq!(p.data_offset % 4096, 0);
         let mut expect = p.data_offset;
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn refuses_a_split_that_does_not_divide() {
         let (dir, ck) = ck(&[("layers.0.attn.wq_b.weight", "F8_E4M3", &[1002, 64])]);
-        let err = make_plan(&ck, 0, 4).unwrap_err();
+        let err = make_plan(&ck.tensors, 0, 4).unwrap_err();
         assert!(err.contains("do not split"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -781,7 +781,7 @@ mod tests {
     #[test]
     fn refuses_a_tensor_with_no_rule() {
         let (dir, ck) = ck(&[("layers.0.mystery.weight", "BF16", &[8])]);
-        let err = make_plan(&ck, 0, 4).unwrap_err();
+        let err = make_plan(&ck.tensors, 0, 4).unwrap_err();
         assert!(err.contains("no rule"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -793,7 +793,7 @@ mod tests {
             ("layers.1.engram.embed.weight", "F8_E4M3", &[64, 256]),
             ("layers.0.attn_norm.weight", "BF16", &[8]),
         ]);
-        let p = make_plan(&ck, 0, 4).unwrap();
+        let p = make_plan(&ck.tensors, 0, 4).unwrap();
         assert_eq!(p.skipped.len(), 2);
         assert_eq!(p.tensors.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -818,7 +818,7 @@ mod tests {
         let (dir, ck) = ck(&refs);
         for world in [4u32, 2] {
             for r in 0..world {
-                let p = make_plan(&ck, r, world).unwrap_or_else(|e| panic!("world {world} rank {r}: {e}"));
+                let p = make_plan(&ck.tensors, r, world).unwrap_or_else(|e| panic!("world {world} rank {r}: {e}"));
                 let get = |n: &str| p.tensors.iter().find(|t| t.name == n).unwrap();
                 let (w1, s1) = (get("layers.0.ffn.experts.w1.weight"), get("layers.0.ffn.experts.w1.scale"));
                 // Rows: the rows split, the columns (and so the scales) stay whole.
@@ -840,7 +840,7 @@ mod tests {
             ("layers.0.ffn.experts.0.w1.weight", "I8", &[64, 128]),
             ("layers.0.ffn.experts.0.w1.scale", "F8_E8M0", &[64, 4]),
         ]);
-        let err = make_plan(&ck, 0, 4).unwrap_err();
+        let err = make_plan(&ck.tensors, 0, 4).unwrap_err();
         assert!(err.contains("does not match weight"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -20,6 +20,11 @@
 #   ./start.sh clear           delete the rank files, journals, Engram shards and
 #                              scratch of earlier runs, keeping the checkpoint
 #                              (prepare --clear does the same, then converts)
+#   ./start.sh reshard --world N   re-cut an existing rank set for another TP from
+#                              the rank files alone (no checkpoint, no network, no
+#                              GPU): --from DIR (default ~/dsgb10/convert), --to DIR
+#                              (default ~/dsgb10/convert-tpN). The engine still
+#                              serves TP=4 only, so this is for trying other splits.
 #   ./start.sh --help
 #   DRY_RUN=1 ./start.sh       print the docker command, change nothing
 #   DSGB10_NO_AUTH=1 ./start.sh   serve without a bearer key (no key file needed)
@@ -138,6 +143,21 @@ prepare() {
     die "prepare failed (HF_DEBUG=1 ./start.sh prepare for the traceback)"
 }
 
+# ./start.sh reshard: re-cut a finished rank set for another world. Offline by
+# construction (`--network none`): every byte comes from the old files.
+reshard() {
+  local ttyarg=()
+  [ -t 0 ] && ttyarg=(-it)
+  log "reshard: re-cutting an existing rank set inside the container (no checkpoint, no network)"
+  if [ "$DRY" = "1" ]; then
+    echo "    docker run --rm ${ttyarg[*]} --network none -v $HOME:/root \\"
+    echo "      $IMAGE prepare/target/release/dsw-prepare reshard $*"
+    return 0
+  fi
+  docker run --rm "${ttyarg[@]}" --network none -v "$HOME:/root" -w /work/ds41f-4xgx10-switchless \
+    "$IMAGE" prepare/target/release/dsw-prepare reshard "$@" || die "reshard failed"
+}
+
 # The image encoder is a side process on rank 0 (docs/vision.md): it imports the
 # checkpoint's own inference/vision.py, so it needs torch, PIL and safetensors —
 # an image of its own, named by VISION_IMAGE, not the engine image.
@@ -165,7 +185,7 @@ start_vision() {
 
 MODE=start
 case "${1:-}" in
-  start | restart | status | fleet | prepare | clear) MODE=$1; shift ;;
+  start | restart | status | fleet | prepare | clear | reshard) MODE=$1; shift ;;
   -h | --help | help) usage; exit 0 ;;
 esac
 for arg in "$@"; do
@@ -180,8 +200,8 @@ if [ "$MODE" = "fleet" ]; then
     --out "${FLEET_ENV:-$REPO/fleet.conf}" "$@"
 fi
 
-# A clear only deletes files: no fleet, no GPU.
-if [ "$MODE" != "clear" ]; then
+# A clear or a reshard only touches files: no fleet, no GPU, no checkpoint.
+if [ "$MODE" != "clear" ] && [ "$MODE" != "reshard" ]; then
   [ -f "$FLEET" ] || die "fleet file $FLEET not found (./start.sh fleet generates one from TP and WORKERS, or set FLEET=FILE)"
   for ((r = 1; r < TP; r++)); do
     grep -q "^RANK${r}_SSH=" "$FLEET" || die "fleet file $FLEET has no RANK${r}_SSH (TP=$TP needs ranks 0..$((TP - 1)))"
@@ -208,6 +228,10 @@ if [ "$MODE" = "prepare" ]; then
 fi
 if [ "$MODE" = "clear" ]; then
   clear_outputs "$@"
+  exit 0
+fi
+if [ "$MODE" = "reshard" ]; then
+  reshard "$@"
   exit 0
 fi
 

@@ -403,3 +403,153 @@ fn hybrid_downloads_whole_shards_and_leaves_no_scratch() {
     let _ = std::fs::remove_dir_all(&ckdir);
     let _ = std::fs::remove_dir_all(&out);
 }
+
+// ---------------------------------------------------------------- resharding
+
+/// A rank file's table of contents, by tensor name: offset, bytes, checksum.
+fn toc_of(path: &Path) -> std::collections::BTreeMap<String, (u64, u64, u32)> {
+    use dsw_prepare::dsw::{TocEntry, TOC_ENTRY_BYTES};
+    let f = File::open(path).unwrap();
+    let mut hb = [0u8; HEADER_BYTES];
+    f.read_exact_at(&mut hb, 0).unwrap();
+    let h = Header::from_bytes(&hb);
+    let mut tb = vec![0u8; (h.data_offset - h.toc_offset) as usize];
+    f.read_exact_at(&mut tb, h.toc_offset).unwrap();
+    let mut m = std::collections::BTreeMap::new();
+    for i in 0..h.n_tensors as usize {
+        let e = TocEntry::from_bytes(&tb[i * TOC_ENTRY_BYTES..(i + 1) * TOC_ENTRY_BYTES]);
+        m.insert(e.name(), (e.offset, e.bytes, e.crc32c));
+    }
+    m
+}
+
+/// The Engram shards of one directory as (layer, rank, records), header dropped.
+fn engram_records(dir: &Path) -> Vec<(u32, u32, Vec<u8>)> {
+    let mut out = Vec::new();
+    let Ok(d) = std::fs::read_dir(dir.join("engram")) else { return out };
+    for e in d.filter_map(|e| e.ok()) {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix("engram-l") else { continue };
+        let (layer, rest) = rest.split_once("-r").unwrap();
+        let (rank, _) = rest.split_once("of").unwrap();
+        let bytes = std::fs::read(e.path()).unwrap();
+        out.push((layer.parse().unwrap(), rank.parse().unwrap(), bytes[4096..].to_vec()));
+    }
+    out.sort_by_key(|(l, r, _)| (*l, *r));
+    out
+}
+
+fn reshard_options(from: &Path, world: u32, out: &Path) -> dsw_prepare::reshard::Options {
+    dsw_prepare::reshard::Options {
+        from: from.to_path_buf(),
+        world,
+        out: out.to_path_buf(),
+        // Empty: every rank of the new world, which is also what the CLI passes.
+        ranks: Vec::new(),
+        verify: true,
+        replace: false,
+        engram: true,
+    }
+}
+
+#[test]
+fn a_reshard_cuts_two_ways_and_back_to_the_same_bytes() {
+    let ckdir = out_dir("rs-ck");
+    write_checkpoint(&ckdir);
+    let four = out_dir("rs-4");
+    let ck = Checkpoint::open(&ckdir).unwrap();
+    convert::run(&ck, &reader(&ck), &options(&four, false), "test").unwrap();
+
+    // 4 -> 2: independent of the resharder, every file is re-derived from the
+    // checkpoint at the world its own header claims.
+    let two = out_dir("rs-2");
+    let r = dsw_prepare::reshard::run(&reshard_options(&four, 2, &two)).unwrap();
+    assert_eq!(r.files.len(), 2);
+    assert_eq!(r.engram_files, 4, "two layers, two ranks each");
+    for rank in 0..2u32 {
+        convert::verify_file(&ck, &two.join(format!("rank{rank}.dsw"))).unwrap();
+    }
+    // The two-way row split doubles every rank's rows.
+    let a0 = toc_of(&four.join("rank0.dsw"));
+    let b0 = toc_of(&two.join("rank0.dsw"));
+    let wq = "layers.0.attn.wq_b.weight";
+    assert_eq!(b0[wq].1, a0[wq].1 * 2, "rows 16 -> 32 of a 64-row tensor");
+
+    // 2 -> 4: the same bytes the checkpoint produced the first time.
+    let back = out_dir("rs-back");
+    dsw_prepare::reshard::run(&reshard_options(&two, 4, &back)).unwrap();
+    for rank in 0..4u32 {
+        let p = four.join(format!("rank{rank}.dsw"));
+        let q = back.join(format!("rank{rank}.dsw"));
+        let tp = toc_of(&p);
+        let tq = toc_of(&q);
+        assert_eq!(tp.keys().collect::<Vec<_>>(), tq.keys().collect::<Vec<_>>());
+        let fp = File::open(&p).unwrap();
+        let fq = File::open(&q).unwrap();
+        for (name, &(off, bytes, crc)) in &tp {
+            let (off2, bytes2, crc2) = tq[name];
+            assert_eq!((off2, bytes2, crc2), (off, bytes, crc), "{name}: offset, size or checksum");
+            let mut x = vec![0u8; bytes as usize];
+            let mut y = vec![0u8; bytes as usize];
+            fp.read_exact_at(&mut x, off).unwrap();
+            fq.read_exact_at(&mut y, off2).unwrap();
+            assert_eq!(x, y, "{name}: bytes");
+        }
+    }
+    // and the Engram shards come back to the four-way records.
+    assert_eq!(engram_records(&back)[..], engram_records(&four)[..]);
+
+    // The two-way Engram shards hold the same rows, four instead of two each.
+    let four_recs = engram_records(&four);
+    let two_recs = engram_records(&two);
+    for layer in [1u32, 14] {
+        let joined4: Vec<u8> = four_recs.iter().filter(|(l, _, _)| *l == layer).flat_map(|(_, _, b)| b.clone()).collect();
+        let joined2: Vec<u8> = two_recs.iter().filter(|(l, _, _)| *l == layer).flat_map(|(_, _, b)| b.clone()).collect();
+        assert_eq!(joined4, joined2, "layer {layer}: the rows are the same, only the cut differs");
+    }
+
+    let _ = std::fs::remove_dir_all(&ckdir);
+    for d in [&four, &two, &back] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn a_reshard_refuses_a_split_the_tensors_cannot_take() {
+    let ckdir = out_dir("rs-ck3");
+    write_checkpoint(&ckdir);
+    let four = out_dir("rs-4b");
+    let ck = Checkpoint::open(&ckdir).unwrap();
+    convert::run(&ck, &reader(&ck), &options(&four, false), "test").unwrap();
+    let three = out_dir("rs-3");
+    let err = dsw_prepare::reshard::run(&reshard_options(&four, 3, &three)).unwrap_err();
+    assert!(err.contains("do not split"), "{err}");
+    assert!(!three.join("rank0.dsw").exists(), "nothing is written when the plan cannot be built");
+    let _ = std::fs::remove_dir_all(&ckdir);
+    let _ = std::fs::remove_dir_all(&four);
+    let _ = std::fs::remove_dir_all(&three);
+}
+
+#[test]
+fn a_reshard_refuses_a_damaged_source() {
+    let ckdir = out_dir("rs-ckd");
+    write_checkpoint(&ckdir);
+    let four = out_dir("rs-4c");
+    let ck = Checkpoint::open(&ckdir).unwrap();
+    convert::run(&ck, &reader(&ck), &options(&four, false), "test").unwrap();
+
+    // One byte of rank 1's slice of a split tensor is corrupted: a replicated
+    // one would be read from rank 0 and the damage would never show.
+    let victim = four.join("rank1.dsw");
+    let (off, _, _) = toc_of(&victim)["layers.0.attn.wq_b.weight"];
+    {
+        let f = std::fs::OpenOptions::new().write(true).open(&victim).unwrap();
+        f.write_all_at(&[0xA5], off + 16).unwrap();
+    }
+    let two = out_dir("rs-2d");
+    let err = dsw_prepare::reshard::run(&reshard_options(&four, 2, &two)).unwrap_err();
+    assert!(err.contains("CRC mismatch"), "{err}");
+    let _ = std::fs::remove_dir_all(&ckdir);
+    let _ = std::fs::remove_dir_all(&four);
+    let _ = std::fs::remove_dir_all(&two);
+}

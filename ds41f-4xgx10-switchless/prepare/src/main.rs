@@ -90,7 +90,7 @@ fn admit(out: &Path, need: u64, free: u64, consume: bool, peak: Option<u64>) -> 
 
 fn usage() -> ! {
     eprintln!(
-        "usage: dsw-prepare <prepare|verify|plan|clear|status> [options]\n\
+        "usage: dsw-prepare <prepare|verify|plan|clear|reshard|status> [options]\n\
          \n\
          prepare  --ckpt DIR  --out DIR  [--world N] [--ranks LIST] [--source local|http]\n\
          \x20        [--consume] [--clear] [--no-verify] [--no-resume] [--no-engram]\n\
@@ -99,6 +99,8 @@ fn usage() -> ! {
          plan     [--ckpt DIR] [--world N] [--rank R]\n\
          clear    [--out DIR]   delete the rank files, journals, Engram shards and\n\
          \x20                     scratch of earlier runs (never the checkpoint)\n\
+         reshard  [--from DIR] [--to DIR] --world N [--ranks LIST] [--replace]\n\
+         \x20        [--no-verify] [--no-engram]\n\
          status   [--out DIR]"
     );
     std::process::exit(2);
@@ -137,6 +139,9 @@ fn main() {
     let mut endpoint = std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".into());
     let mut file: Option<PathBuf> = None;
     let mut rank: Option<u32> = None;
+    // reshard: the finished set to read and where the re-cut one goes.
+    let mut from: Option<PathBuf> = None;
+    let mut to: Option<PathBuf> = None;
     let mut dump = false;
     // VISION=1 keeps the encoder's slice of the checkpoint; the flags override it.
     let mut vision = std::env::var("VISION").map(|v| v == "1").unwrap_or(false);
@@ -183,6 +188,8 @@ fn main() {
             "--rev" => rev = arg(&args, &mut i, a).into(),
             "--endpoint" => endpoint = arg(&args, &mut i, a).into(),
             "--file" => file = Some(PathBuf::from(arg(&args, &mut i, a))),
+            "--from" => from = Some(PathBuf::from(arg(&args, &mut i, a))),
+            "--to" => to = Some(PathBuf::from(arg(&args, &mut i, a))),
             // One line per tensor, the format `plan_dump` prints: the two plans are
             // compared with `diff` on the same checkpoint.
             "--dump" => dump = true,
@@ -223,7 +230,7 @@ fn main() {
         "plan" => {
             let ck = Checkpoint::open(&ckpt).unwrap_or_else(|e| die(&e));
             let r = rank.unwrap_or(0);
-            let p = plan::make_plan(&ck, r, world).unwrap_or_else(|e| die(&e));
+            let p = plan::make_plan(&ck.tensors, r, world).unwrap_or_else(|e| die(&e));
             if dump {
                 println!(
                     "rank {r} of {world}: {} tensors, {} bytes, {} skipped",
@@ -284,6 +291,32 @@ fn main() {
                 );
             }
         }
+        "reshard" => {
+            let ro = dsw_prepare::reshard::Options {
+                from: from.unwrap_or_else(|| home().join("dsgb10/convert")),
+                world,
+                out: to.unwrap_or_else(|| home().join(format!("dsgb10/convert-tp{world}"))),
+                ranks: ranks.unwrap_or_default(),
+                verify,
+                replace,
+                engram,
+            };
+            let r = dsw_prepare::reshard::run(&ro).unwrap_or_else(|e| die(&e));
+            println!(
+                "[dsw-prepare] world {}: {} rank file(s), {} tensors, {:.1} GB written, {} Engram shard(s)",
+                r.world,
+                r.files.len(),
+                r.tensors,
+                r.bytes as f64 / 1e9,
+                r.engram_files
+            );
+            if r.world != 4 {
+                println!(
+                    "[dsw-prepare] note: the engine serves TP=4 only (common/tp.h), so these files need a build that takes {}",
+                    r.world
+                );
+            }
+        }
         "status" => status(&out, world),
         _ => usage(),
     }
@@ -329,11 +362,11 @@ fn prepare(ckpt: &Path, o: &Options, source: &str, repo: &str, rev: &str, endpoi
     // What this run will write, per rank, from the plan itself.
     let mut need: u64 = 0;
     for &r in &o.ranks {
-        let p = plan::make_plan(&ck, r, o.world).unwrap_or_else(|e| die(&e));
+        let p = plan::make_plan(&ck.tensors, r, o.world).unwrap_or_else(|e| die(&e));
         let mut bytes = p.file_bytes;
         if o.engram {
             for t in dsw_prepare::engram::tables(&ck).unwrap_or_else(|e| die(&e)) {
-                bytes += dsw_prepare::engram::shard_bytes(&t, r);
+                bytes += dsw_prepare::engram::shard_bytes(&t, r, o.world);
             }
         }
         println!(

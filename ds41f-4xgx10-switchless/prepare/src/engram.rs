@@ -72,17 +72,23 @@ pub fn tables(ck: &Checkpoint) -> Result<Vec<Table>, String> {
     Ok(out)
 }
 
-/// The rows of `t` that rank `r` owns: `[lo, hi)`.
-pub fn rows_of(t: &Table, rank: u32) -> (u64, u64) {
-    (t.rows * rank as u64 / WORLD as u64, t.rows * (rank as u64 + 1) / WORLD as u64)
+/// The rows of `t` that rank `r` of `world` owns: `[lo, hi)`. The engine reads
+/// `WORLD` ways; other values are for re-cutting, not for serving.
+pub fn rows_of(t: &Table, rank: u32, world: u32) -> (u64, u64) {
+    rows_of_for(t.rows, rank, world)
 }
 
-pub fn shard_name(layer: u32, rank: u32) -> String {
-    format!("engram-l{layer}-r{rank}of{WORLD}.bin")
+/// The same split for a table known only by its row count.
+pub fn rows_of_for(rows: u64, rank: u32, world: u32) -> (u64, u64) {
+    (rows * rank as u64 / world as u64, rows * (rank as u64 + 1) / world as u64)
 }
 
-pub fn shard_bytes(t: &Table, rank: u32) -> u64 {
-    let (lo, hi) = rows_of(t, rank);
+pub fn shard_name(layer: u32, rank: u32, world: u32) -> String {
+    format!("engram-l{layer}-r{rank}of{world}.bin")
+}
+
+pub fn shard_bytes(t: &Table, rank: u32, world: u32) -> u64 {
+    let (lo, hi) = rows_of(t, rank, world);
     HEADER_BYTES + (hi - lo) * ROW_BYTES
 }
 
@@ -155,11 +161,12 @@ mod tests {
     fn the_split_is_the_kits_four_way_one() {
         let (dir, ck) = ck(&[1], 1000);
         let t = &tables(&ck).unwrap()[0];
-        assert_eq!(rows_of(t, 0), (0, 250));
-        assert_eq!(rows_of(t, 1), (250, 500));
-        assert_eq!(rows_of(t, 3), (750, 1000));
-        assert_eq!(shard_bytes(t, 1), HEADER_BYTES + 250 * ROW_BYTES);
-        assert_eq!(shard_name(14, 2), "engram-l14-r2of4.bin");
+        assert_eq!(rows_of(t, 0, 4), (0, 250));
+        assert_eq!(rows_of(t, 1, 4), (250, 500));
+        assert_eq!(rows_of(t, 3, 4), (750, 1000));
+        assert_eq!(rows_of(t, 1, 2), (500, 1000));
+        assert_eq!(shard_bytes(t, 1, 4), HEADER_BYTES + 250 * ROW_BYTES);
+        assert_eq!(shard_name(14, 2, 4), "engram-l14-r2of4.bin");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
